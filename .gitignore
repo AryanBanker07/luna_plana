@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+dist/
+
+# Build artifacts & temp logs
+temp/
+*.tsbuildinfo
+.DS_Store
+Thumbs.db
+
+# Large raw screen recordings
+*.mp4
+*.mov

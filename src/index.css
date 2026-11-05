@@ -1,0 +1,121 @@
+@import "tailwindcss";
+
+:root {
+  --bg-void: #05070b;
+  --bg-bezel: rgba(10, 14, 22, 0.86);
+  --bg-bezel-solid: #0b1019;
+  --bg-elevated: #121927;
+  --border-hairline: rgba(226, 232, 240, 0.09);
+  --border-strong: rgba(226, 232, 240, 0.18);
+  --accent-amber: #f59e0b;
+  --accent-cyan: #38bdf8;
+  --status-go: #10b981;
+  --status-caution: #f59e0b;
+  --status-nogo: #ef4444;
+  --font-display: 'Chakra Petch', sans-serif;
+  --font-sans: 'Instrument Sans', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-void);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-mono-tech {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Aerospace Instrument Bezel */
+.hud-panel {
+  background: linear-gradient(180deg, rgba(13, 19, 30, 0.88) 0%, rgba(8, 12, 20, 0.92) 100%);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-hairline);
+  box-shadow:
+    0 18px 40px -12px rgba(0, 0, 0, 0.72),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.05);
+}
+
+/* Corner reticle ticks for primary telemetry frames */
+.reticle-frame {
+  position: relative;
+}
+.reticle-frame::before,
+.reticle-frame::after {
+  content: '';
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  pointer-events: none;
+  border-color: rgba(245, 158, 11, 0.45);
+}
+.reticle-frame::before {
+  top: -1px;
+  left: -1px;
+  border-top: 1.5px solid rgba(245, 158, 11, 0.55);
+  border-left: 1.5px solid rgba(245, 158, 11, 0.55);
+}
+.reticle-frame::after {
+  bottom: -1px;
+  right: -1px;
+  border-bottom: 1.5px solid rgba(56, 189, 248, 0.5);
+  border-right: 1.5px solid rgba(56, 189, 248, 0.5);
+}
+
+/* Subtle custom scrollbars for dense telemetry panels */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(5, 7, 11, 0.4);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.22);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(245, 158, 11, 0.5);
+}
+
+/* Tactile button transitions (ECC make-interfaces-feel-better) */
+.hud-btn {
+  transition-property: transform, background-color, border-color, color, box-shadow, opacity;
+  transition-duration: 150ms;
+  transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+}
+.hud-btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+/* Subtle scanline grid overlay for background void */
+.space-grid-overlay {
+  background-image:
+    radial-gradient(circle at 50% 50%, rgba(56, 189, 248, 0.04) 0%, transparent 65%),
+    linear-gradient(to right, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.018) 1px, transparent 1px);
+  background-size: 100% 100%, 48px 48px, 48px 48px;
+}
+
