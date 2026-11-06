@@ -692,6 +692,8 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
   const shaderRef = useRef<THREE.ShaderMaterial>(null);
   const controlsRef = useRef<any>(null);
   const beaconRefs = useRef<Map<string, THREE.Mesh>>(new Map());
+  const satelliteGroupRefs = useRef<Map<string, THREE.Group>>(new Map());
+  const roverModelGroupRef = useRef<THREE.Group>(null);
   const pointerDownPos = useRef<{ x: number; y: number } | null>(null);
   const userGrabbedDuringAnim = useRef<boolean>(false);
   const { camera } = useThree();
@@ -878,13 +880,29 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
   useFrame((state, delta) => {
     const camDist = camera.position.length();
 
-    // Continuous altitude-adaptive beacon scale:
+    // Continuous altitude-adaptive dynamic scale factor:
     // At full globe overview (camDist >= 2.4), pointScale = 1.0 (easy to spot and click from space).
     // At close zoom (camDist <= 1.25, e.g. South Pole exploration view), pointScale scales down to ~0.20 (20% of original size).
     const pointScale = Math.max(0.18, Math.min(1.0, (camDist - 1.0) / 1.35));
     beaconRefs.current.forEach((mesh) => {
       mesh.scale.set(pointScale, pointScale, pointScale);
     });
+
+    // Dynamically scale satellite models in orbit based on camera altitude
+    const satScale = Math.max(0.35, Math.min(1.0, (camDist - 1.0) / 1.35));
+    satelliteGroupRefs.current.forEach((grp) => {
+      grp.scale.set(satScale, satScale, satScale);
+    });
+
+    // Dynamically scale the articulated 3D lunar rover model based on camera altitude
+    if (roverModelGroupRef.current) {
+      const baseRoverScale = Math.max(
+        0.32,
+        Math.min(0.95, 0.28 + (roverPlan?.totalDistanceKm ?? 0) * 0.011)
+      );
+      const liveRoverScale = baseRoverScale * Math.max(0.20, pointScale);
+      roverModelGroupRef.current.scale.set(liveRoverScale, liveRoverScale, liveRoverScale);
+    }
 
     if (shaderRef.current) {
       const u = shaderRef.current.uniforms;
@@ -1336,36 +1354,51 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
         return (
           <>
             <group position={subSolPos}>
-              <mesh>
+              <mesh
+                ref={(el) => {
+                  if (el) beaconRefs.current.set('sub-solar', el);
+                  else beaconRefs.current.delete('sub-solar');
+                }}
+              >
                 <sphereGeometry args={[0.016, 16, 16]} />
                 <meshBasicMaterial color="#fde047" />
               </mesh>
-              <Html position={[0, 0.028, 0]} center zIndexRange={[18, 0]}>
-                <div className="pointer-events-none px-1.5 py-0.2 rounded bg-amber-950/90 border border-yellow-400/60 text-yellow-200 font-mono-tech text-[9px] whitespace-nowrap">
+              <Html position={[0, 0, 0]} center zIndexRange={[18, 0]}>
+                <div className="-translate-y-3.5 pointer-events-none px-1.5 py-0.2 rounded bg-amber-950/90 border border-yellow-400/60 text-yellow-200 font-mono-tech text-[9px] whitespace-nowrap">
                   ☉ Sub-Solar ({evaluation.sun.subLat.toFixed(1)}°, {evaluation.sun.subLon.toFixed(1)}°)
                 </div>
               </Html>
             </group>
 
             <group position={subEarthPos}>
-              <mesh>
+              <mesh
+                ref={(el) => {
+                  if (el) beaconRefs.current.set('sub-earth', el);
+                  else beaconRefs.current.delete('sub-earth');
+                }}
+              >
                 <sphereGeometry args={[0.016, 16, 16]} />
                 <meshBasicMaterial color="#38bdf8" />
               </mesh>
-              <Html position={[0, 0.028, 0]} center zIndexRange={[18, 0]}>
-                <div className="pointer-events-none px-1.5 py-0.2 rounded bg-sky-950/90 border border-sky-400/60 text-sky-200 font-mono-tech text-[9px] whitespace-nowrap">
+              <Html position={[0, 0, 0]} center zIndexRange={[18, 0]}>
+                <div className="-translate-y-3.5 pointer-events-none px-1.5 py-0.2 rounded bg-sky-950/90 border border-sky-400/60 text-sky-200 font-mono-tech text-[9px] whitespace-nowrap">
                   ⊕ Sub-Earth ({evaluation.earth.subLat.toFixed(1)}°, {evaluation.earth.subLon.toFixed(1)}°)
                 </div>
               </Html>
             </group>
 
             <group position={prevPos}>
-              <mesh>
-                <octahedronGeometry args={[0.022, 0]} />
+              <mesh
+                ref={(el) => {
+                  if (el) beaconRefs.current.set('preview-target', el);
+                  else beaconRefs.current.delete('preview-target');
+                }}
+              >
+                <octahedronGeometry args={[0.020, 0]} />
                 <meshBasicMaterial color="#22d3ee" />
               </mesh>
-              <Html position={[0, 0.036, 0]} center zIndexRange={[22, 0]}>
-                <div className="pointer-events-none px-2 py-0.5 rounded bg-cyan-950/95 border border-cyan-300/80 text-cyan-100 font-mono-tech font-bold text-[9.5px] whitespace-nowrap shadow-xl">
+              <Html position={[0, 0, 0]} center zIndexRange={[22, 0]}>
+                <div className="-translate-y-3.5 pointer-events-none px-2 py-0.5 rounded bg-cyan-950/95 border border-cyan-300/80 text-cyan-100 font-mono-tech font-bold text-[9.5px] whitespace-nowrap shadow-xl">
                   ⌖ {previewSunEarthPoint.label} ({previewSunEarthPoint.lat.toFixed(2)}°, {previewSunEarthPoint.lon.toFixed(2)}°)
                 </div>
               </Html>
@@ -1442,12 +1475,17 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
         const remMs = Math.max(0, satWarpNode.targetTimeMs - evaluation.timestampMs);
         return (
           <group position={satWarpNode.pos}>
-            <mesh>
+            <mesh
+              ref={(el) => {
+                if (el) beaconRefs.current.set('sat-warp-node', el);
+                else beaconRefs.current.delete('sat-warp-node');
+              }}
+            >
               <octahedronGeometry args={[0.022, 0]} />
               <meshBasicMaterial color="#22c55e" />
             </mesh>
-            <Html position={[0, 0.045, 0]} center zIndexRange={[30, 0]}>
-              <div className="pointer-events-auto rounded-lg bg-[#04130d]/95 border border-emerald-400/80 px-2.5 py-1.5 font-mono-tech shadow-2xl space-y-1 min-w-[175px]">
+            <Html position={[0, 0, 0]} center zIndexRange={[30, 0]}>
+              <div className="-translate-y-16 pointer-events-auto rounded-lg bg-[#04130d]/95 border border-emerald-400/80 px-2.5 py-1.5 font-mono-tech shadow-2xl space-y-1 min-w-[175px]">
                 <div className="flex items-center justify-between gap-2 text-[9.5px] text-emerald-300 font-bold">
                   <span>🛰 {satWarpNode.satName} Node</span>
                   <button
@@ -1537,24 +1575,31 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
                   onSelectSatellite(sat.id);
                 }}
               >
-                <mesh>
-                  <octahedronGeometry args={[isFocus ? 0.032 : 0.022, 0]} />
-                  <meshBasicMaterial color={sat.color} />
-                </mesh>
-                {/* Solar Array Crossbar */}
-                <mesh rotation={[0, 0, Math.PI / 4]}>
-                  <boxGeometry args={[isFocus ? 0.11 : 0.075, 0.008, 0.018]} />
-                  <meshBasicMaterial color={isFocus ? '#fef08a' : sat.color} />
-                </mesh>
+                <group
+                  ref={(el) => {
+                    if (el) satelliteGroupRefs.current.set(sat.id, el);
+                    else satelliteGroupRefs.current.delete(sat.id);
+                  }}
+                >
+                  <mesh>
+                    <octahedronGeometry args={[isFocus ? 0.032 : 0.022, 0]} />
+                    <meshBasicMaterial color={sat.color} />
+                  </mesh>
+                  {/* Solar Array Crossbar */}
+                  <mesh rotation={[0, 0, Math.PI / 4]}>
+                    <boxGeometry args={[isFocus ? 0.11 : 0.075, 0.008, 0.018]} />
+                    <meshBasicMaterial color={isFocus ? '#fef08a' : sat.color} />
+                  </mesh>
+                </group>
 
-                <Html position={[0, 0.045, 0]} center zIndexRange={[8, 0]}>
+                <Html position={[0, 0, 0]} center zIndexRange={[8, 0]}>
                   <button
                     type="button"
                     onClick={(ev) => {
                       ev.stopPropagation();
                       onSelectSatellite(sat.id);
                     }}
-                    className={`hud-btn px-1.5 py-0.5 rounded text-[10px] font-mono-tech whitespace-nowrap border cursor-pointer ${
+                    className={`-translate-y-4 hud-btn px-1.5 py-0.5 rounded text-[10px] font-mono-tech whitespace-nowrap border cursor-pointer ${
                       isFocus
                         ? 'bg-slate-900/95 text-white border-white/60 shadow-lg font-semibold'
                         : isVisibleFromSite
@@ -1682,16 +1727,20 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
                           {isExploringRange && onSelectCandidatePath && (
                             <group position={leafPos}>
                               <mesh
+                                ref={(el) => {
+                                  if (el) beaconRefs.current.set(`corridor-${cp.id}`, el);
+                                  else beaconRefs.current.delete(`corridor-${cp.id}`);
+                                }}
                                 onClick={(ev) => {
                                   ev.stopPropagation();
                                   onSelectCandidatePath(cp);
                                 }}
                               >
-                                <sphereGeometry args={[0.0038, 12, 12]} />
+                                <sphereGeometry args={[0.007, 12, 12]} />
                                 <meshBasicMaterial color="#38bdf8" />
                               </mesh>
                               <Html
-                                position={[0, 0.008, 0]}
+                                position={[0, 0, 0]}
                                 center
                                 zIndexRange={[12, 0]}
                               >
@@ -1701,7 +1750,7 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
                                     ev.stopPropagation();
                                     onSelectCandidatePath(cp);
                                   }}
-                                  className="hud-btn px-1.5 py-0.5 rounded bg-[#08121e]/90 hover:bg-[#38bdf8] text-[#7dd3fc] hover:text-[#05070b] font-mono-tech text-[8.5px] border border-[#38bdf8]/45 whitespace-nowrap cursor-pointer shadow"
+                                  className="-translate-y-3.5 hud-btn px-1.5 py-0.5 rounded bg-[#08121e]/90 hover:bg-[#38bdf8] text-[#7dd3fc] hover:text-[#05070b] font-mono-tech text-[8.5px] border border-[#38bdf8]/45 whitespace-nowrap cursor-pointer shadow"
                                   title={`Select ${cp.label} endpoint as Goal [B]`}
                                 >
                                   ◇ {cp.sectorName} {cp.distanceKm.toFixed(1)}km
@@ -1719,12 +1768,17 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
               {/* START [A] BEACON */}
               {startPos3D && (
                 <group position={startPos3D}>
-                  <mesh>
-                    <sphereGeometry args={[0.0065, 16, 16]} />
+                  <mesh
+                    ref={(el) => {
+                      if (el) beaconRefs.current.set('rover-start', el);
+                      else beaconRefs.current.delete('rover-start');
+                    }}
+                  >
+                    <sphereGeometry args={[0.012, 16, 16]} />
                     <meshBasicMaterial color="#10b981" />
                   </mesh>
-                  <Html position={[0, 0.015, 0]} center zIndexRange={[14, 0]}>
-                    <div className="pointer-events-none px-1.5 py-0.5 rounded bg-emerald-500 text-[#05070b] font-mono-tech font-bold text-[9px] border border-emerald-200 whitespace-nowrap shadow">
+                  <Html position={[0, 0, 0]} center zIndexRange={[14, 0]}>
+                    <div className="-translate-y-3.5 pointer-events-none px-1.5 py-0.5 rounded bg-emerald-500 text-[#05070b] font-mono-tech font-bold text-[9px] border border-emerald-200 whitespace-nowrap shadow">
                       A • START
                     </div>
                   </Html>
@@ -1742,12 +1796,17 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
                   );
                   return (
                     <group key={idx} position={[cx, cy, cz]}>
-                      <mesh>
-                        <sphereGeometry args={[0.0052, 14, 14]} />
+                      <mesh
+                        ref={(el) => {
+                          if (el) beaconRefs.current.set(`rover-cp-${idx}`, el);
+                          else beaconRefs.current.delete(`rover-cp-${idx}`);
+                        }}
+                      >
+                        <sphereGeometry args={[0.010, 14, 14]} />
                         <meshBasicMaterial color="#06b6d4" />
                       </mesh>
-                      <Html position={[0, 0.014, 0]} center zIndexRange={[13, 0]}>
-                        <div className="pointer-events-none px-1.5 py-0.5 rounded bg-cyan-950/92 text-cyan-300 font-mono-tech font-bold text-[8.5px] border border-cyan-400/60 whitespace-nowrap shadow-lg">
+                      <Html position={[0, 0, 0]} center zIndexRange={[13, 0]}>
+                        <div className="-translate-y-3.5 pointer-events-none px-1.5 py-0.5 rounded bg-cyan-950/92 text-cyan-300 font-mono-tech font-bold text-[8.5px] border border-cyan-400/60 whitespace-nowrap shadow-lg">
                           CP {idx + 1}
                         </div>
                       </Html>
@@ -1940,14 +1999,19 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
                       />
                     )}
 
-                    {/* Goal Waypoint [B] */}
+                    {/* Goal Waypoint [B] (Dynamically scales with zoom) */}
                     <group position={endPos}>
-                      <mesh>
-                        <sphereGeometry args={[0.0065, 16, 16]} />
+                      <mesh
+                        ref={(el) => {
+                          if (el) beaconRefs.current.set('rover-goal', el);
+                          else beaconRefs.current.delete('rover-goal');
+                        }}
+                      >
+                        <sphereGeometry args={[0.012, 16, 16]} />
                         <meshBasicMaterial color="#38bdf8" />
                       </mesh>
-                      <Html position={[0, 0.015, 0]} center zIndexRange={[14, 0]}>
-                        <div className="pointer-events-none px-1.5 py-0.5 rounded bg-[#38bdf8] text-[#05070b] font-mono-tech font-bold text-[9px] border border-sky-200 whitespace-nowrap shadow">
+                      <Html position={[0, 0, 0]} center zIndexRange={[14, 0]}>
+                        <div className="-translate-y-3.5 pointer-events-none px-1.5 py-0.5 rounded bg-[#38bdf8] text-[#05070b] font-mono-tech font-bold text-[9px] border border-sky-200 whitespace-nowrap shadow">
                           B • GOAL ({roverPlan.totalDistanceKm} km)
                         </div>
                       </Html>
@@ -1958,7 +2022,10 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
                       position={[roverVec.x, roverVec.y, roverVec.z]}
                       quaternion={roverQuat}
                     >
-                      <group scale={[roverScale, roverScale, roverScale]}>
+                      <group
+                        ref={roverModelGroupRef}
+                        scale={[roverScale, roverScale, roverScale]}
+                      >
                         {/* Thermal-Gold Rover Chassis */}
                         <mesh position={[0, 0.0055, 0]}>
                           <boxGeometry args={[0.013, 0.007, 0.019]} />
@@ -2012,8 +2079,8 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
                         )}
                       </group>
 
-                      <Html position={[0, 0.022 * roverScale + 0.006, 0]} center zIndexRange={[16, 0]}>
-                        <div className="pointer-events-none px-1.5 py-0.5 rounded bg-[#090d16]/92 text-[#fde68a] font-mono-tech text-[9px] border border-[#f59e0b]/75 whitespace-nowrap shadow-lg">
+                      <Html position={[0, 0, 0]} center zIndexRange={[16, 0]}>
+                        <div className="-translate-y-4 pointer-events-none px-1.5 py-0.5 rounded bg-[#090d16]/92 text-[#fde68a] font-mono-tech text-[9px] border border-[#f59e0b]/75 whitespace-nowrap shadow-lg">
                           ◈ ROVER • {liveDist}km • {liveSlope}° • {liveSoc}% SoC
                         </div>
                       </Html>

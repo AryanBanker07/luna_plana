@@ -234,5 +234,42 @@ The configuration modal provides comprehensive control over the telemetry output
 - Rover traverse simulation (`roverMissionEpochMs`) is directly editable inside `RoverControlsPanel` (`Planned Mission Time (UTC)`) or via the movable `MissionEpochModal` (`Past/Future` button and top header UTC clock).
 - Changing the planned epoch to any past or future UTC date/time dynamically recomputes solar array generation along every waypoint, Direct-to-Earth libration & cislunar relay visibility, operational range envelopes, and the synchronized **Lunar Surface**, **Moon Around Earth**, and **Earth & Moon Around Sun** 3D views.
 
+---
+
+## 9. Dynamic Altitude-Adaptive Sizing for All 3D Scene Elements & Rover Model
+
+When inspecting high-resolution local polar terrain (e.g., Shackleton crater rim, connecting ridge, or de Gerlache plateau), fixed-size 3D scene elements would otherwise bloat to 30–60 km in equivalent world scale, completely obscuring narrow ridge tracks, boulder hazards, and local relief.
+
+`SELENE OPS` implements **Continuous Altitude-Adaptive Dynamic Scaling** across **every 3D element in the scene** inside the render loop (`useFrame` in `src/components/LunarGlobe3D.tsx`):
+
+### 9.1 Scaling Law & Altitude Coupling
+As the camera moves between global overview ($d_{\text{cam}} \ge 2.35$) and close-range polar exploration ($d_{\text{cam}} \le 1.25$):
+
+$$
+\text{pointScale} = \operatorname{clamp}\left(\frac{d_{\text{cam}} - 1.0}{1.35},\, 0.18,\, 1.0\right)
+$$
+
+- **Global Overview ($d_{\text{cam}} \ge 2.35$):** $\text{pointScale} = 1.0$ (100% full size). Elements are prominent, easily identifiable, and clickable from space.
+- **Close-Range Exploration ($d_{\text{cam}} \le 1.25$):** $\text{pointScale} \approx 0.18\text{–}0.20$ (smoothly scales down to **20%** of original size). Points become compact needle pins, preventing visual clutter over fine micro-relief.
+
+### 9.2 Complete 3D Element Scaling Matrix
+
+| Scene Element | Scaling Mechanism | Scaling Ratio ($\text{Zoomed In} \to \text{Zoomed Out}$) | Label / Placard Behavior |
+| :--- | :--- | :---: | :--- |
+| **3D Articulated Lunar Rover** | `roverModelGroupRef` (`useFrame`) | $\text{liveScale} = \text{baseScale} \cdot \max(0.20,\, \text{pointScale})$ ($\sim 20\% \to 100\%$) | HTML HUD badge floats cleanly with `-translate-y-4` screen pixels |
+| **Start Waypoint [A]** | `beaconRefs.set('rover-start')` | $r: 0.0024 \to 0.012$ ($20\% \to 100\%$) | Compact emerald badge `-translate-y-3.5` |
+| **Checkpoints [CP 1, 2...]** | `beaconRefs.set('rover-cp-${idx}')` | $r: 0.0020 \to 0.010$ ($20\% \to 100\%$) | Cyan badge `-translate-y-3.5` |
+| **Goal Waypoint [B]** | `beaconRefs.set('rover-goal')` | $r: 0.0024 \to 0.012$ ($20\% \to 100\%$) | Sky blue badge `-translate-y-3.5` |
+| **Candidate Corridors (Branches)** | `beaconRefs.set('corridor-${cp.id}')` | $r: 0.0024 \to 0.012$ ($20\% \to 100\%$) | Interactive branch selector pill `-translate-y-3.5` |
+| **Landing Site Beacons** | `beaconRefs.set(s.id)` | $r: 0.0017\text{–}0.0028 \to 0.0085\text{–}0.014$ ($20\% \to 100\%$) | Retains generous $r = 0.009$ hit box for effortless raycast selection |
+| **Custom Site Pin** | `beaconRefs.set('custom')` | $r: 0.0030 \to 0.015$ ($20\% \to 100\%$) | Amber badge `-translate-y-3.5` |
+| **Cold-Trap PSR Landmarks** | `beaconRefs.set('lm-${lm.name}')` | $r: 0.0010 \to 0.005$ ($20\% \to 100\%$) | Cyan badge `-translate-y-3` |
+| **Sub-Solar (☉) & Sub-Earth (⊕)** | `beaconRefs.set('sub-solar' / 'sub-earth')` | $r: 0.0032 \to 0.016$ ($20\% \to 100\%$) | Top placarded amber/sky badges `-translate-y-3.5` |
+| **Preview Target Reticle** | `beaconRefs.set('preview-target')` | $r: 0.0040 \to 0.020$ ($20\% \to 100\%$) | Cyan reticle badge `-translate-y-3.5` |
+| **Cislunar Orbiters (Bus + Arrays)** | `satelliteGroupRefs.set(sat.id)` | $\text{satScale} \in [0.35, 1.0]$ | Invariant screen-pixel badge `-translate-y-4` |
+| **Orbital Warp-To Node** | `beaconRefs.set('sat-warp-node')` | $r: 0.0044 \to 0.022$ ($20\% \to 100\%$) | Warp/Snap action card `-translate-y-16` |
+| **GPU Surface Radar Rings** | GLSL Uniform `uPinScale` | Multiplier $0.18 \to 1.0$ applied to radar rings and pulses | Physically glued to 3D surface topography |
+
+
 
 
