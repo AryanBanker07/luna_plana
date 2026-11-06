@@ -18,7 +18,7 @@ Missions targeting the Lunar South Pole under NASA's **Commercial Lunar Payload 
 
 ## 2. Vault Knowledge Graph
 
-- [[01_Selenographic_Physics_and_Ephemeris]] — Optical libration, sub-solar ephemeris, LOLA spherical horizon ray-marching, Newton-Raphson Keplerian propagation, **Geocentric (`Moon Around Earth`) & Heliocentric (`Earth & Moon Around Sun`) 3D views**, and **Past/Future UTC Mission Epoch selection**.
+- [[01_Selenographic_Physics_and_Ephemeris]] — Optical libration, sub-solar ephemeris, LOLA spherical horizon ray-marching, Newton-Raphson Keplerian propagation, **Geocentric (`Moon Around Earth`) & Heliocentric (`Earth & Moon Around Sun`) 3D views**, **Past/Future UTC Mission Epoch selection**, **KSP-style `"Warp To"` / `"Warp Here"` auto-warp**, and **Manual Location Selection WRT Sun & Earth**.
 - [[02_Multi_Physics_Heatmaps_Reference]] — GPU GLSL shader models and NASA instrument provenance for all 7 global lunar heatmaps.
 - [[03_Cislunar_Constellation_and_Relay_Access]] — Orbital mechanics and access capabilities of **LRO**, **Danuri (ShadowCam)**, **Queqiao-2**, **CAPSTONE (NRHO)**, and **Lunar Pathfinder**.
 - [[04_Candidate_Landing_Sites_Analysis]] — Benchmark comparison of 10 Artemis III, CLPS, ISRU, and historic landing ellipses.

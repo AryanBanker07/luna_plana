@@ -1,4 +1,8 @@
-import { CelestialSystemState, MissionEpochPreset } from '../types/lunar';
+import {
+  CelestialSystemState,
+  MissionEpochPreset,
+  WarpTargetOption,
+} from '../types/lunar';
 
 const DEG2RAD = Math.PI / 180;
 const RAD2DEG = 180 / Math.PI;
@@ -456,4 +460,372 @@ export function sampleEarthHeliocentricOrbit(
     decSolsticePoint: evalEarthAtLon(90),
     moonEpicycleTrail,
   };
+}
+
+/**
+ * Evaluate exact 3D scene point on Moon's osculating geocentric orbit at any ecliptic longitude
+ */
+export function evalMoonOrbitPointAtLon(
+  state: CelestialSystemState,
+  lonDeg: number,
+  mapDistanceKmToScene: (distKm: number) => number
+): [number, number, number] {
+  const e = 0.0549;
+  const incRad = 5.145396 * DEG2RAD;
+  const omegaNode = state.ascendingNodeLonDeg;
+  const perigeeLon = state.perigeeLonDeg;
+  const nuNow = (state.moonGeoLonDeg - perigeeLon) * DEG2RAD;
+  const unscaledNow = (1 - e * e) / (1 + e * Math.cos(nuNow));
+  const aOscKm = state.earthMoonDistanceKm / Math.max(0.5, unscaledNow);
+
+  const nu = (lonDeg - perigeeLon) * DEG2RAD;
+  const rKm = (aOscKm * (1 - e * e)) / (1 + e * Math.cos(nu));
+  const uRad = (lonDeg - omegaNode) * DEG2RAD;
+  const latDeg =
+    Math.asin(Math.max(-1, Math.min(1, Math.sin(incRad) * Math.sin(uRad)))) * RAD2DEG;
+  return eclipticToCartesian(latDeg, lonDeg, mapDistanceKmToScene(rKm));
+}
+
+/**
+ * Evaluate exact 3D scene point on Earth's heliocentric 1 AU orbit at any heliocentric longitude
+ */
+export function evalEarthOrbitPointAtLon(
+  lonDeg: number,
+  auSceneRadius: number,
+  exaggerateEccentricity = 2.5
+): [number, number, number] {
+  const ePhys = 0.0167086;
+  const eVis = Math.min(0.08, ePhys * exaggerateEccentricity);
+  const perihelionLon = 102.9373;
+  const nu = (lonDeg - perihelionLon) * DEG2RAD;
+  const rScene = (auSceneRadius * (1 - eVis * eVis)) / (1 + eVis * Math.cos(nu));
+  return eclipticToCartesian(0, lonDeg, rScene);
+}
+
+/**
+ * Format duration in KSP style: e.g. "4d 11h 23m" or "18m 42s"
+ */
+export function formatWarpDelta(deltaMs: number): string {
+  const absSec = Math.max(0, Math.round(Math.abs(deltaMs) / 1000));
+  const d = Math.floor(absSec / 86400);
+  const h = Math.floor((absSec % 86400) / 3600);
+  const m = Math.floor((absSec % 3600) / 60);
+  const s = absSec % 60;
+  if (d >= 365) {
+    const yrs = Math.floor(d / 365);
+    const remD = d % 365;
+    return `${yrs}y ${remD}d ${h}h`;
+  }
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+// High-precision unrounded internal orbital angles & distance for sub-second root-finding
+function evalRawOrbitalAngles(timeMs: number): {
+  earthHelioLonDeg: number;
+  sunGeoLonDeg: number;
+  moonGeoLonDeg: number;
+  elongationDeg: number;
+  ascendingNodeLonDeg: number;
+  earthMoonDistKm: number;
+} {
+  const d = (timeMs - J2000_MS) / 86400000;
+  const T = d / 36525;
+  const L0 = norm360(280.46646 + 0.98564736 * d);
+  const MsunDeg = norm360(357.52911 + 0.98560028 * d);
+  const Msun = MsunDeg * DEG2RAD;
+  const Csun =
+    (1.914602 - 0.004817 * T) * Math.sin(Msun) +
+    0.019993 * Math.sin(2 * Msun) +
+    0.000289 * Math.sin(3 * Msun);
+  const sunGeoLonDeg = norm360(L0 + Csun);
+  const earthHelioLonDeg = norm360(sunGeoLonDeg + 180);
+
+  const synodicCycles = (d - 19.694) / SYNODIC_MONTH_DAYS;
+  const synodicPhaseRad = synodicCycles * 2 * Math.PI;
+  const meanElongationDeg = norm360(180 + synodicCycles * 360);
+  const moonMeanAnomalyDeg = norm360(((d - 4.52) / 27.55455) * 360);
+  const Mmoon = moonMeanAnomalyDeg * DEG2RAD;
+  const evectionArg = 2 * synodicPhaseRad - Mmoon;
+  const DmeanRad = meanElongationDeg * DEG2RAD;
+  const deltaLonMoon =
+    6.289 * Math.sin(Mmoon) +
+    1.274 * Math.sin(evectionArg) +
+    0.658 * Math.sin(2 * DmeanRad);
+  const moonGeoLonDeg = norm360(sunGeoLonDeg + meanElongationDeg + deltaLonMoon);
+  const ascendingNodeLonDeg = norm360(125.04452 - 0.05295377 * d);
+  const earthMoonDistKm =
+    384400 - 20905 * Math.cos(Mmoon) - 3699 * Math.cos(evectionArg);
+
+  return {
+    earthHelioLonDeg,
+    sunGeoLonDeg,
+    moonGeoLonDeg,
+    elongationDeg: norm360(moonGeoLonDeg - sunGeoLonDeg),
+    ascendingNodeLonDeg,
+    earthMoonDistKm,
+  };
+}
+
+/**
+ * Find exact next timestamp (> fromTimeMs) when Moon reaches target geocentric ecliptic longitude
+ */
+export function solveNextMoonGeocentricLonTime(
+  fromTimeMs: number,
+  targetLonDeg: number
+): number {
+  const target = norm360(targetLonDeg);
+  const nowAngles = evalRawOrbitalAngles(fromTimeMs);
+  let dLon = norm360(target - nowAngles.moonGeoLonDeg);
+  if (dLon < 0.05) dLon += 360;
+  const meanSiderealRateDegPerDay = 360 / 27.321661;
+  let t = fromTimeMs + (dLon / meanSiderealRateDegPerDay) * 86400000;
+
+  for (let i = 0; i < 8; i++) {
+    const cur = evalRawOrbitalAngles(t).moonGeoLonDeg;
+    const err = norm180(target - cur);
+    t += (err / meanSiderealRateDegPerDay) * 86400000;
+  }
+  return Math.max(fromTimeMs + 30000, Math.round(t));
+}
+
+/**
+ * Find exact next timestamp (> fromTimeMs) when Moon reaches target Sun–Earth elongation angle:
+ * 0° = Sub-Solar (New Moon), 90° = First Quarter, 180° = Anti-Solar (Full Moon), 270° = Third Quarter
+ */
+export function solveNextMoonElongationTime(
+  fromTimeMs: number,
+  targetElongationDeg: number
+): number {
+  const target = norm360(targetElongationDeg);
+  const nowAngles = evalRawOrbitalAngles(fromTimeMs);
+  let dElong = norm360(target - nowAngles.elongationDeg);
+  if (dElong < 0.05) dElong += 360;
+  const meanSynodicRateDegPerDay = 360 / SYNODIC_MONTH_DAYS;
+  let t = fromTimeMs + (dElong / meanSynodicRateDegPerDay) * 86400000;
+
+  for (let i = 0; i < 9; i++) {
+    const cur = evalRawOrbitalAngles(t).elongationDeg;
+    const err = norm180(target - cur);
+    t += (err / meanSynodicRateDegPerDay) * 86400000;
+  }
+  return Math.max(fromTimeMs + 30000, Math.round(t));
+}
+
+/**
+ * Find exact next timestamp (> fromTimeMs) for Lunar Perigee, Apogee, Ascending Node, or Descending Node
+ */
+export function solveNextLunarApsisOrNodeTime(
+  fromTimeMs: number,
+  event: 'perigee' | 'apogee' | 'ascending-node' | 'descending-node'
+): number {
+  if (event === 'ascending-node' || event === 'descending-node') {
+    const targetU = event === 'ascending-node' ? 0 : 180;
+    const nowA = evalRawOrbitalAngles(fromTimeMs);
+    const curU = norm360(nowA.moonGeoLonDeg - nowA.ascendingNodeLonDeg);
+    let dU = norm360(targetU - curU);
+    if (dU < 0.05) dU += 360;
+    const draconicRateDegPerDay = 360 / 27.212221;
+    let t = fromTimeMs + (dU / draconicRateDegPerDay) * 86400000;
+    for (let i = 0; i < 8; i++) {
+      const a = evalRawOrbitalAngles(t);
+      const u = norm360(a.moonGeoLonDeg - a.ascendingNodeLonDeg);
+      const err = norm180(targetU - u);
+      t += (err / draconicRateDegPerDay) * 86400000;
+    }
+    return Math.max(fromTimeMs + 30000, Math.round(t));
+  }
+
+  // Perigee (minimum distance, M ≈ 0°) or Apogee (maximum distance, M ≈ 180°)
+  const d0 = (fromTimeMs - J2000_MS) / 86400000;
+  const curM = norm360(((d0 - 4.52) / 27.55455) * 360);
+  const targetM = event === 'perigee' ? 0 : 180;
+  let dM = norm360(targetM - curM);
+  if (dM < 2.0) dM += 360;
+  const estCenterMs = fromTimeMs + (dM / 360) * 27.55455 * 86400000;
+
+  // Golden-section search over +/- 2.0 days to capture exact evection-perturbed extremum
+  let a = Math.max(fromTimeMs + 60000, estCenterMs - 2.0 * 86400000);
+  let b = estCenterMs + 2.0 * 86400000;
+  const phi = (Math.sqrt(5) - 1) / 2;
+  let c = b - phi * (b - a);
+  let dPt = a + phi * (b - a);
+  const score = (ms: number) => {
+    const dist = evalRawOrbitalAngles(ms).earthMoonDistKm;
+    return event === 'perigee' ? dist : -dist;
+  };
+  let fc = score(c);
+  let fd = score(dPt);
+  for (let i = 0; i < 22; i++) {
+    if (fc < fd) {
+      b = dPt;
+      dPt = c;
+      fd = fc;
+      c = b - phi * (b - a);
+      fc = score(c);
+    } else {
+      a = c;
+      c = dPt;
+      fc = fd;
+      dPt = a + phi * (b - a);
+      fd = score(dPt);
+    }
+  }
+  return Math.round((a + b) / 2);
+}
+
+/**
+ * Find exact next timestamp (> fromTimeMs) when Earth reaches target heliocentric longitude (0..360°)
+ */
+export function solveNextEarthHelioLonTime(
+  fromTimeMs: number,
+  targetHelioLonDeg: number
+): number {
+  const target = norm360(targetHelioLonDeg);
+  const nowA = evalRawOrbitalAngles(fromTimeMs);
+  let dLon = norm360(target - nowA.earthHelioLonDeg);
+  if (dLon < 0.02) dLon += 360;
+  const meanEarthRateDegPerDay = 360 / 365.25636;
+  let t = fromTimeMs + (dLon / meanEarthRateDegPerDay) * 86400000;
+
+  for (let i = 0; i < 8; i++) {
+    const cur = evalRawOrbitalAngles(t).earthHelioLonDeg;
+    const err = norm180(target - cur);
+    t += (err / meanEarthRateDegPerDay) * 86400000;
+  }
+  return Math.max(fromTimeMs + 30000, Math.round(t));
+}
+
+/**
+ * Curated list of upcoming Cislunar & Heliocentric KSP "Warp To" orbital milestones
+ */
+export function computeOrbitalWarpTargets(fromTimeMs: number): WarpTargetOption[] {
+  const perigeeMs = solveNextLunarApsisOrNodeTime(fromTimeMs, 'perigee');
+  const apogeeMs = solveNextLunarApsisOrNodeTime(fromTimeMs, 'apogee');
+  const ascNodeMs = solveNextLunarApsisOrNodeTime(fromTimeMs, 'ascending-node');
+  const descNodeMs = solveNextLunarApsisOrNodeTime(fromTimeMs, 'descending-node');
+
+  const newMoonMs = solveNextMoonElongationTime(fromTimeMs, 0);
+  const fqMoonMs = solveNextMoonElongationTime(fromTimeMs, 90);
+  const fullMoonMs = solveNextMoonElongationTime(fromTimeMs, 180);
+  const tqMoonMs = solveNextMoonElongationTime(fromTimeMs, 270);
+
+  const perihelionMs = solveNextEarthHelioLonTime(fromTimeMs, 102.9373);
+  const aphelionMs = solveNextEarthHelioLonTime(fromTimeMs, 282.9373);
+
+  // Soonest upcoming cardinal season (Equinox or Solstice)
+  const seasons = [
+    { lbl: 'March Equinox (λ⊕ 180°)', lon: 180 },
+    { lbl: 'June Solstice (λ⊕ 270°)', lon: 270 },
+    { lbl: 'September Equinox (λ⊕ 0°)', lon: 0 },
+    { lbl: 'December Solstice (λ⊕ 90°)', lon: 90 },
+  ].map((s) => ({
+    ...s,
+    ms: solveNextEarthHelioLonTime(fromTimeMs, s.lon),
+  }));
+  seasons.sort((a, b) => a.ms - b.ms);
+  const nextSeason = seasons[0];
+
+  const perigeeDist = Math.round(evalRawOrbitalAngles(perigeeMs).earthMoonDistKm);
+  const apogeeDist = Math.round(evalRawOrbitalAngles(apogeeMs).earthMoonDistKm);
+
+  const lunarTargets: WarpTargetOption[] = [
+    {
+      id: 'moon-perigee',
+      label: 'Lunar Perigee (Pe)',
+      subtitle: `Closest Earth approach (~${perigeeDist.toLocaleString()} km)`,
+      targetTimeMs: perigeeMs,
+      category: 'lunar-orbit',
+      recommendedView: 'earth-moon',
+    },
+    {
+      id: 'moon-apogee',
+      label: 'Lunar Apogee (Ap)',
+      subtitle: `Farthest Earth distance (~${apogeeDist.toLocaleString()} km)`,
+      targetTimeMs: apogeeMs,
+      category: 'lunar-orbit',
+      recommendedView: 'earth-moon',
+    },
+    {
+      id: 'moon-an',
+      label: 'Ascending Node (☊ AN)',
+      subtitle: 'Moon crosses Ecliptic Plane Northward (β = 0°)',
+      targetTimeMs: ascNodeMs,
+      category: 'lunar-orbit',
+      recommendedView: 'earth-moon',
+    },
+    {
+      id: 'moon-dn',
+      label: 'Descending Node (☋ DN)',
+      subtitle: 'Moon crosses Ecliptic Plane Southward (β = 0°)',
+      targetTimeMs: descNodeMs,
+      category: 'lunar-orbit',
+      recommendedView: 'earth-moon',
+    },
+    {
+      id: 'phase-new',
+      label: 'New Moon (0° Sub-Solar)',
+      subtitle: 'Moon directly between Earth & Sun (Far-Side Noon)',
+      targetTimeMs: newMoonMs,
+      category: 'lunar-orbit',
+      recommendedView: 'earth-moon',
+    },
+    {
+      id: 'phase-fq',
+      label: 'First Quarter (90° E)',
+      subtitle: 'Evening quadrature wrt Sun–Earth line (50% lit)',
+      targetTimeMs: fqMoonMs,
+      category: 'lunar-orbit',
+      recommendedView: 'earth-moon',
+    },
+    {
+      id: 'phase-full',
+      label: 'Full Moon (180° Anti-Solar)',
+      subtitle: 'Opposition wrt Sun–Earth line (Near-Side Noon)',
+      targetTimeMs: fullMoonMs,
+      category: 'lunar-orbit',
+      recommendedView: 'earth-moon',
+    },
+    {
+      id: 'phase-tq',
+      label: 'Third Quarter (270° W)',
+      subtitle: 'Morning quadrature wrt Sun–Earth line (50% lit)',
+      targetTimeMs: tqMoonMs,
+      category: 'lunar-orbit',
+      recommendedView: 'earth-moon',
+    },
+  ];
+  lunarTargets.sort((a, b) => a.targetTimeMs - b.targetTimeMs);
+
+  const helioTargets: WarpTargetOption[] = [
+    {
+      id: 'earth-season',
+      label: nextSeason.lbl,
+      subtitle: 'Next cardinal solar declination milestone',
+      targetTimeMs: nextSeason.ms,
+      category: 'heliocentric',
+      recommendedView: 'heliocentric',
+    },
+    {
+      id: 'earth-perihelion',
+      label: 'Earth Perihelion (Pe)',
+      subtitle: 'Closest to Sun (~0.9833 AU • Max orbital speed)',
+      targetTimeMs: perihelionMs,
+      category: 'heliocentric',
+      recommendedView: 'heliocentric',
+    },
+    {
+      id: 'earth-aphelion',
+      label: 'Earth Aphelion (Ap)',
+      subtitle: 'Farthest from Sun (~1.0167 AU • Min orbital speed)',
+      targetTimeMs: aphelionMs,
+      category: 'heliocentric',
+      recommendedView: 'heliocentric',
+    },
+  ];
+  helioTargets.sort((a, b) => a.targetTimeMs - b.targetTimeMs);
+
+  return [...lunarTargets, ...helioTargets];
 }

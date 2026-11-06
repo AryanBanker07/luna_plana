@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   ArrowLeftRight,
@@ -41,6 +41,7 @@ import {
   computeSynodicTimeline,
   evaluateLandingSite,
   findOptimalTouchdownWindows,
+  getDemResolutionAt,
   initLolaDemSampler,
   onLolaDemLoaded,
   predictSatellitePasses,
@@ -55,6 +56,8 @@ import {
   CelestialSystem3D,
 } from './components/CelestialSystem3D';
 import { MissionEpochModal } from './components/MissionEpochModal';
+import { KspActiveWarpBanner, KspWarpMenu } from './components/KspWarpMenu';
+import { SunEarthLocatorModal } from './components/SunEarthLocatorModal';
 import { PolarHorizonSkyplot } from './components/PolarHorizonSkyplot';
 import { SynodicTimelineDrawer } from './components/SynodicTimelineDrawer';
 import { SiteComparisonModal } from './components/SiteComparisonModal';
@@ -64,6 +67,7 @@ import {
   RoverElevationDrawer,
 } from './components/RoverMissionPlanner';
 import {
+  ActiveTimeWarpState,
   CandidateCorridorPath,
   HeatmapMode,
   LandingSite,
@@ -187,7 +191,17 @@ export function App() {
   const [astroNonce, setAstroNonce] = useState<number>(0);
   const [astroTrueScale, setAstroTrueScale] = useState<boolean>(false);
   const [isEpochModalOpen, setIsEpochModalOpen] = useState<boolean>(false);
+  const [isSunEarthModalOpen, setIsSunEarthModalOpen] = useState<boolean>(false);
+  const [previewSunEarthPoint, setPreviewSunEarthPoint] = useState<{
+    lat: number;
+    lon: number;
+    label: string;
+  } | null>(null);
+  const [activeWarp, setActiveWarp] = useState<ActiveTimeWarpState | null>(null);
   const [zenMode, setZenMode] = useState<boolean>(false);
+
+  const simTimeRef = useRef<number>(simTimeMs);
+  simTimeRef.current = simTimeMs;
 
   const [hoverCoords, setHoverCoords] = useState<{
     lat: number;
@@ -202,9 +216,10 @@ export function App() {
     return onLolaDemLoaded(() => setDemReadyTick((t) => t + 1));
   }, []);
 
-  // Simulation Clock Loop
+  // Simulation Clock Loop (yields while KSP Auto-Warp is active)
+  const isWarping = activeWarp !== null;
   useEffect(() => {
-    if (!isPlaying) return;
+    if (!isPlaying || isWarping) return;
     let last = performance.now();
     let rafId = 0;
 
@@ -216,7 +231,82 @@ export function App() {
     };
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [isPlaying, speedMult]);
+  }, [isPlaying, speedMult, isWarping]);
+
+  // Kerbal Space Program (KSP) Smooth Auto-Warp Controller with Proportional Deceleration
+  const warpSessionKey = activeWarp
+    ? `${activeWarp.startedRealMs}:${activeWarp.targetTimeMs}`
+    : '';
+  useEffect(() => {
+    if (!activeWarp) return;
+    const { startTimeMs, targetTimeMs, startedRealMs } = activeWarp;
+    let currentSim = simTimeRef.current;
+    let last = performance.now();
+    let rafId = 0;
+
+    const tick = (now: number) => {
+      const dtSec = Math.min(0.08, Math.max(0.001, (now - last) / 1000));
+      last = now;
+
+      const totalSpan = Math.max(1000, Math.abs(targetTimeMs - startTimeMs));
+      const rem = targetTimeMs - currentSim;
+      const remAbs = Math.abs(rem);
+
+      // Smooth 0.35s ramp-up + KSP proportional deceleration as target approaches
+      const elapsedRealMs = Math.max(0, now - startedRealMs);
+      const rampIn = Math.min(1, 0.18 + (elapsedRealMs / 350) * 0.82);
+      const peakRateMsPerSec = totalSpan / 2.4;
+      const decelRateMsPerSec = Math.max(totalSpan * 0.035, remAbs * 2.8);
+      const rateMsPerSec = Math.min(peakRateMsPerSec * rampIn, decelRateMsPerSec);
+      const stepAbs = Math.min(remAbs, rateMsPerSec * dtSec);
+
+      if (remAbs - stepAbs <= Math.max(250, totalSpan * 0.0008)) {
+        simTimeRef.current = targetTimeMs;
+        setSimTimeMs(targetTimeMs);
+        setRoverMissionEpochMs(targetTimeMs);
+        setIsPlaying(false);
+        setActiveWarp(null);
+        return;
+      }
+
+      currentSim += Math.sign(rem) * stepAbs;
+      simTimeRef.current = currentSim;
+      setSimTimeMs(currentSim);
+
+      const currentRateMult = Math.max(1, rateMsPerSec / 1000);
+      const warpArrows = Math.max(
+        1,
+        Math.min(6, Math.ceil((rateMsPerSec / peakRateMsPerSec) * 6))
+      );
+      setActiveWarp((prev) =>
+        prev ? { ...prev, currentRateMult, warpArrows } : null
+      );
+
+      rafId = requestAnimationFrame(tick);
+    };
+
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [warpSessionKey]);
+
+  // Escape key aborts active KSP Time Warp when no modal is open
+  useEffect(() => {
+    if (!activeWarp) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (
+        e.key === 'Escape' &&
+        !isEpochModalOpen &&
+        !isCompareOpen &&
+        !isSunEarthModalOpen
+      ) {
+        setActiveWarp(null);
+        setIsPlaying(false);
+        setRoverMissionEpochMs(simTimeRef.current);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [warpSessionKey, isEpochModalOpen, isCompareOpen, isSunEarthModalOpen]);
 
   // Keep 30-day timeline window centered/anchored if user jumps far outside [anchor, anchor + 30d]
   useEffect(() => {
@@ -350,6 +440,8 @@ export function App() {
     pauseClock = true
   ) => {
     if (!Number.isFinite(newTimeMs)) return;
+    setActiveWarp(null);
+    simTimeRef.current = newTimeMs;
     setSimTimeMs(newTimeMs);
     if (syncRoverEpoch) {
       setRoverMissionEpochMs(newTimeMs);
@@ -358,6 +450,58 @@ export function App() {
     if (pauseClock) {
       setIsPlaying(false);
     }
+  };
+
+  // KSP "Warp To" / "Warp Here" Initiation & Snap Handlers
+  const applyWarpViewSwitch = (switchToView?: ViewportViewMode) => {
+    if (!switchToView || switchToView === viewMode) return;
+    setViewMode(switchToView);
+    if (switchToView === 'earth-moon') {
+      setAstroPreset('em-overview');
+      setAstroNonce((n) => n + 1);
+    } else if (switchToView === 'heliocentric') {
+      setAstroPreset('helio-overview');
+      setAstroNonce((n) => n + 1);
+    }
+  };
+
+  const handleSnapTime = (
+    targetTimeMs: number,
+    switchToView?: ViewportViewMode
+  ) => {
+    if (!Number.isFinite(targetTimeMs)) return;
+    applyWarpViewSwitch(switchToView);
+    handleApplyMissionTime(targetTimeMs, true, true);
+  };
+
+  const handleStartWarp = (
+    targetTimeMs: number,
+    label: string,
+    switchToView?: ViewportViewMode
+  ) => {
+    if (!Number.isFinite(targetTimeMs)) return;
+    applyWarpViewSwitch(switchToView);
+    const startMs = simTimeRef.current;
+    if (Math.abs(targetTimeMs - startMs) < 1000) {
+      handleApplyMissionTime(targetTimeMs, true, true);
+      return;
+    }
+    stopRoverAnimation();
+    setIsPlaying(false);
+    setActiveWarp({
+      label,
+      startTimeMs: startMs,
+      targetTimeMs,
+      startedRealMs: performance.now(),
+      currentRateMult: 1,
+      warpArrows: 1,
+    });
+  };
+
+  const handleCancelWarp = () => {
+    setActiveWarp(null);
+    setIsPlaying(false);
+    setRoverMissionEpochMs(simTimeRef.current);
   };
 
   // Step 1: "Plan Mission" entry point
@@ -370,16 +514,28 @@ export function App() {
     setRoverWorkflowStep('rover-setup');
   };
 
+  const ensureSurfaceView = (targetLat?: number) => {
+    setViewMode((prev) => {
+      if (prev === 'south-pole') {
+        return targetLat !== undefined && targetLat > -70 ? 'lunar-globe' : 'south-pole';
+      }
+      if (prev === 'lunar-globe') {
+        return 'lunar-globe';
+      }
+      return targetLat !== undefined && targetLat <= -78 ? 'south-pole' : 'lunar-globe';
+    });
+  };
+
   // Step 2 -> 3
   const handleConfirmRoverDetails = () => {
-    setViewMode('lunar-globe');
+    ensureSurfaceView(roverStart.lat);
     setRoverWorkflowStep('select-start');
     setRoverPickMode('pick-start');
   };
 
   // Step 3 -> 3.5 (locality zoom) -> 3.7 (checkpoints) -> 4 (range + paths) -> 5 (pick end)
   const handleConfirmStartAndZoomLocality = (coords: RoverCoords) => {
-    setViewMode('lunar-globe');
+    ensureSurfaceView(coords.lat);
     setRoverStart(coords);
     stopRoverAnimation();
     setRoverWorkflowStep('checkpoints');
@@ -437,7 +593,7 @@ export function App() {
 
   // Step 6: generate rover navigation animation
   const handleStartAnimation = () => {
-    setViewMode('lunar-globe');
+    ensureSurfaceView(roverStart.lat);
     setRoverAnimProgress(0);
     setRoverWorkflowStep('animating');
     setBottomDrawerMode('rover');
@@ -450,7 +606,7 @@ export function App() {
       setIsRoverAnimating(false);
       return;
     }
-    setViewMode('lunar-globe');
+    ensureSurfaceView(roverStart.lat);
     if (roverAnimProgress >= 0.995) setRoverAnimProgress(0);
     if (roverWorkflowStep !== 'animating') setRoverWorkflowStep('animating');
     setIsRoverAnimating(true);
@@ -459,7 +615,7 @@ export function App() {
   const handleSelectBenchmarkRoute = (routeId: string) => {
     const found = BENCHMARK_ROVER_ROUTES.find((r) => r.id === routeId);
     if (!found) return;
-    setViewMode('lunar-globe');
+    ensureSurfaceView(found.start.lat);
     setRoverStart(found.start);
     setRoverEnd(found.end);
     setRoverCheckpoints([]);
@@ -509,8 +665,12 @@ export function App() {
     [heatmapMode]
   );
 
-  const triggerCamera = (preset: CameraPreset) => {
-    setViewMode('lunar-globe');
+  const triggerCamera = (preset: CameraPreset, forceMode?: 'lunar-globe' | 'south-pole') => {
+    if (forceMode) {
+      setViewMode(forceMode);
+    } else {
+      ensureSurfaceView(selectedSite.lat);
+    }
     setCameraPreset(preset);
     setCameraNonce((n) => n + 1);
   };
@@ -522,21 +682,34 @@ export function App() {
 
   const handleSelectSite = (site: LandingSite) => {
     setSelectedSite(site);
-    if (viewMode === 'lunar-globe') {
+    if (viewMode === 'south-pole') {
+      if (site.lat > -70) {
+        setViewMode('lunar-globe');
+      }
+      setCameraPreset('site');
+      setCameraNonce((n) => n + 1);
+    } else if (viewMode === 'lunar-globe') {
       setCameraPreset('site');
       setCameraNonce((n) => n + 1);
     }
   };
 
-  const handleSelectCustomPoint = (lat: number, lon: number) => {
+  const handleSelectCustomPoint = (
+    lat: number,
+    lon: number,
+    customName?: string
+  ) => {
+    const coordStr = `${Math.abs(lat).toFixed(2)}°${lat >= 0 ? 'N' : 'S'}, ${Math.abs(
+      lon
+    ).toFixed(2)}°${lon >= 0 ? 'E' : 'W'}`;
     const custom: LandingSite = {
       id: `custom-${lat.toFixed(2)}-${lon.toFixed(2)}`,
-      name: `Custom Target (${Math.abs(lat).toFixed(2)}°${lat >= 0 ? 'N' : 'S'}, ${Math.abs(
-        lon
-      ).toFixed(2)}°${lon >= 0 ? 'E' : 'W'})`,
-      subtitle: 'Planner-Designated Selenographic Coordinate',
+      name: customName ? `${customName} (${coordStr})` : `Custom Target (${coordStr})`,
+      subtitle: customName
+        ? 'Sun & Earth Relative Selenographic Target'
+        : 'Custom Selenographic Target',
       category: 'custom',
-      missionTag: 'CUSTOM PIN',
+      missionTag: customName ? 'SUN/EARTH PIN' : 'CUSTOM PIN',
       lat,
       lon,
       geology:
@@ -612,10 +785,11 @@ export function App() {
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-[#05070b] space-grid-overlay text-slate-100">
-      {/* FULL-SCREEN 3D VIEWPORT: LUNAR GLOBE OR EARTH-MOON OR HELIOCENTRIC SUN-EARTH-MOON */}
+      {/* FULL-SCREEN 3D VIEWPORT: LUNAR GLOBE / SOUTH POLE OR EARTH-MOON OR HELIOCENTRIC SUN-EARTH-MOON */}
       <div className="absolute inset-0 z-0">
-        {viewMode === 'lunar-globe' ? (
+        {viewMode === 'lunar-globe' || viewMode === 'south-pole' ? (
           <LunarGlobe3D
+            isSouthPoleFocus={viewMode === 'south-pole'}
             heatmapMode={heatmapMode}
             evaluation={evaluation}
             compareSite={isCompareOpen ? compareSite : null}
@@ -649,6 +823,9 @@ export function App() {
               setLeftTab('satellites');
             }}
             onHoverCoords={setHoverCoords}
+            onWarpToTime={(ms, lbl) => handleStartWarp(ms, lbl)}
+            onSnapToTime={(ms) => handleSnapTime(ms)}
+            previewSunEarthPoint={previewSunEarthPoint}
           />
         ) : (
           <CelestialSystem3D
@@ -665,6 +842,8 @@ export function App() {
               setAstroNonce((n) => n + 1);
             }}
             onSwitchToLunarSurface={() => setViewMode('lunar-globe')}
+            onWarpToTime={(ms, lbl) => handleStartWarp(ms, lbl)}
+            onSnapToTime={(ms) => handleSnapTime(ms)}
           />
         )}
       </div>
@@ -679,29 +858,37 @@ export function App() {
               <Compass className="w-4 h-4" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
-                <h1 className="font-display font-bold text-sm sm:text-base tracking-[0.14em] uppercase text-white">
-                  SELENE OPS
-                </h1>
-                <span className="hidden md:inline-block px-1.5 py-0.5 rounded bg-white/[0.06] border border-white/10 font-mono-tech text-[10px] text-[#fcd34d]">
-                  NASA SPACE APPS 2026
-                </span>
-              </div>
-              <p className="text-[11px] text-slate-400 hidden sm:block">
-                CLPS & Artemis 3D Selenographic Landing Site & Relay Navigator
-              </p>
+              <h1 className="font-display font-bold text-sm sm:text-base tracking-[0.14em] uppercase text-white">
+                SELENE OPS
+              </h1>
             </div>
           </div>
 
-          {/* Live Mission Clock, Past/Future Epoch Picker & Time-Warp Scrubber */}
+          {/* Live Mission Clock, Past/Future Epoch Picker, Time-Warp Scrubber & KSP "Warp To" */}
           <div className="flex flex-wrap items-center gap-1.5 bg-[#060911]/90 px-2.5 py-1 rounded-lg border border-white/10 tabular-nums">
             <button
               type="button"
-              onClick={() => setIsPlaying((p) => !p)}
+              onClick={() => {
+                if (activeWarp) {
+                  handleCancelWarp();
+                } else {
+                  setIsPlaying((p) => !p);
+                }
+              }}
               className="hud-btn w-7 h-7 rounded-md bg-[#f59e0b]/20 hover:bg-[#f59e0b]/35 border border-[#f59e0b]/45 flex items-center justify-center text-[#fcd34d] cursor-pointer"
-              title={isPlaying ? 'Pause Orbital Propagation' : 'Resume Orbital Propagation'}
+              title={
+                activeWarp
+                  ? 'Abort Time Warp'
+                  : isPlaying
+                  ? 'Pause Orbital Propagation'
+                  : 'Resume Orbital Propagation'
+              }
             >
-              {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+              {isPlaying || activeWarp ? (
+                <Pause className="w-3.5 h-3.5" />
+              ) : (
+                <Play className="w-3.5 h-3.5" />
+              )}
             </button>
 
             <button
@@ -724,9 +911,6 @@ export function App() {
                 {epochUtcParts.dateStr} {epochUtcParts.timeStr}
               </span>
               <span className="text-[9.5px] font-mono-tech text-slate-400">UTC</span>
-              <span className="hidden sm:inline-block px-1.5 py-0.2 rounded bg-amber-500/15 border border-amber-400/30 text-[9px] font-mono-tech text-[#fde68a]">
-                {epochRelDelta}
-              </span>
             </button>
 
             <button
@@ -747,11 +931,12 @@ export function App() {
                   type="button"
                   title={opt.title}
                   onClick={() => {
+                    setActiveWarp(null);
                     setSpeedMult(opt.mult);
                     setIsPlaying(true);
                   }}
                   className={`hud-btn px-1.5 py-0.5 rounded text-[10px] font-mono-tech cursor-pointer ${
-                    isPlaying && speedMult === opt.mult
+                    !activeWarp && isPlaying && speedMult === opt.mult
                       ? 'bg-[#38bdf8]/25 text-[#7dd3fc] border border-[#38bdf8]/50'
                       : 'text-slate-400 hover:text-white'
                   }`}
@@ -760,22 +945,55 @@ export function App() {
                 </button>
               ))}
             </div>
+
+            <div className="h-4 w-[1px] bg-white/10 hidden sm:block mx-0.5" />
+
+            {/* KSP "Warp To" Event & Orbital Node Selector */}
+            <KspWarpMenu
+              simTimeMs={simTimeMs}
+              selectedSite={selectedSite}
+              upcomingPasses={upcomingPasses}
+              optimalWindows={optimalWindows}
+              activeWarp={activeWarp}
+              onStartWarp={handleStartWarp}
+              onSnapTime={handleSnapTime}
+              onCancelWarp={handleCancelWarp}
+            />
           </div>
 
           {/* Live Sub-Solar / Sub-Earth Libration & Trade-Study Actions */}
           <div className="flex items-center gap-2">
-            <div className="hidden xl:flex items-center gap-3 px-2.5 py-1 rounded-lg bg-white/[0.03] border border-white/[0.07] text-[11px] font-mono-tech">
-              <span className="text-[#fcd34d]" title="Sub-Solar Selenographic Point">
+            <button
+              type="button"
+              onClick={() => setIsSunEarthModalOpen(true)}
+              className="hidden 2xl:flex items-center gap-2.5 px-2.5 py-1 rounded-lg bg-white/[0.03] hover:bg-cyan-500/10 border border-white/[0.08] hover:border-cyan-400/45 text-[11px] font-mono-tech cursor-pointer transition-colors"
+              title="Click to select a Lunar Surface or Orbital Location manually WRT Sun & Earth"
+            >
+              <span className="text-[#fcd34d]">
                 ☉ Sub-Sol: {evaluation.sun.subLat > 0 ? '+' : ''}
                 {evaluation.sun.subLat}°, {evaluation.sun.subLon}°
               </span>
               <span className="text-white/20">|</span>
-              <span className="text-[#7dd3fc]" title="Sub-Earth Optical Libration Point">
+              <span className="text-[#7dd3fc]">
                 ⊕ Libration: {evaluation.earth.subLat > 0 ? '+' : ''}
                 {evaluation.earth.subLat}°, {evaluation.earth.subLon > 0 ? '+' : ''}
                 {evaluation.earth.subLon}°
               </span>
-            </div>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setIsSunEarthModalOpen(true)}
+              className={`hud-btn flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-mono-tech cursor-pointer ${
+                isSunEarthModalOpen
+                  ? 'bg-cyan-400 text-[#05070b] border-cyan-200 font-semibold'
+                  : 'bg-cyan-500/15 hover:bg-cyan-500/25 border-cyan-400/45 text-cyan-200'
+              }`}
+              title="Select Lunar Surface Target or Orbital Position Manually WRT Sun & Earth"
+            >
+              <Globe className="w-3.5 h-3.5" />
+              <span className="hidden md:inline">☉/⊕ WRT Sun–Earth</span>
+            </button>
 
             <button
               type="button"
@@ -1026,9 +1244,8 @@ export function App() {
 
                   {/* Custom Coordinate Input Box */}
                   <div className="p-2.5 rounded-lg bg-[#060911] border border-white/10 space-y-1.5">
-                    <div className="flex items-center justify-between text-[10px] font-mono-tech text-[#fcd34d]">
+                    <div className="text-[10px] font-mono-tech text-[#fcd34d]">
                       <span>⊕ CUSTOM COORDINATE PIN</span>
-                      <span className="text-slate-400">or click 3D Moon</span>
                     </div>
                     <div className="flex items-center gap-1.5">
                       <input
@@ -1064,6 +1281,15 @@ export function App() {
                         Go
                       </button>
                     </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setIsSunEarthModalOpen(true)}
+                      className="hud-btn w-full mt-1 py-1.5 px-2.5 rounded-md bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-400/45 text-cyan-200 font-mono-tech text-[11px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <Globe className="w-3.5 h-3.5 text-cyan-300" />
+                      <span>☉/⊕ Select Location WRT Sun & Earth</span>
+                    </button>
                   </div>
 
                   {/* Site Cards */}
@@ -1213,25 +1439,27 @@ export function App() {
                     </div>
                   )}
 
-                  {/* Next 24h Access Windows Schedule (Click to Jump Sim Clock!) */}
+                  {/* Next 24h Access Windows Schedule */}
                   <div className="pt-1">
                     <div className="flex items-center justify-between text-[10px] font-mono-tech uppercase text-slate-400 mb-1.5">
                       <span>Upcoming 24h Access Windows</span>
-                      <span className="text-[#fcd34d]">Click → Jump</span>
                     </div>
                     <div className="space-y-1 max-h-[195px] overflow-y-auto pr-0.5">
                       {upcomingPasses.slice(0, 12).map((pw, idx) => {
                         const isNow =
                           simTimeMs >= pw.aosTimeMs && simTimeMs <= pw.losTimeMs;
+                        const shortSatName = pw.satelliteName
+                          .split(' (')[0]
+                          .split(' Relay')[0];
                         return (
                           <button
                             key={`${pw.satelliteId}-${idx}`}
                             type="button"
                             onClick={() => {
                               setSelectedSatelliteId(pw.satelliteId);
-                              setIsPlaying(false);
-                              setSimTimeMs(
-                                Math.round((pw.aosTimeMs + pw.losTimeMs) / 2)
+                              handleStartWarp(
+                                Math.round((pw.aosTimeMs + pw.losTimeMs) / 2),
+                                `${shortSatName} Peak Pass (+${pw.maxElevationDeg}°)`
                               );
                             }}
                             className={`hud-btn w-full text-left px-2 py-1.5 rounded border text-[10px] font-mono-tech cursor-pointer flex items-center justify-between ${
@@ -1247,13 +1475,8 @@ export function App() {
                                   style={{ backgroundColor: pw.color }}
                                 />
                                 <span className="font-semibold text-white">
-                                  {pw.satelliteName.split(' (')[0].split(' Relay')[0]}
+                                  {shortSatName}
                                 </span>
-                                {pw.isRelay && (
-                                  <span className="text-[8px] px-1 rounded bg-white/10 text-[#fcd34d]">
-                                    RELAY
-                                  </span>
-                                )}
                               </div>
                               <div className="text-slate-400 mt-0.5">
                                 {new Date(pw.aosTimeMs).toISOString().slice(11, 16)}Z →{' '}
@@ -1351,7 +1574,7 @@ export function App() {
           {/* CENTER VIEWPORT FLOATING CONTROLS & LEGEND */}
           <main className="flex-1 flex flex-col justify-between items-center pointer-events-none min-w-0">
             <div className="flex flex-col items-center gap-1.5">
-              {/* Primary 3-View Celestial Reference Frame Switcher */}
+              {/* Primary 4-View Celestial & Polar Reference Frame Switcher */}
               <div className="flex flex-wrap items-center justify-center gap-1 hud-panel rounded-full px-2 py-1 pointer-events-auto border border-white/15 shadow-lg">
                 <button
                   type="button"
@@ -1361,10 +1584,30 @@ export function App() {
                       ? 'bg-[#f59e0b] text-[#05070b] font-bold shadow-sm'
                       : 'text-slate-300 hover:text-white hover:bg-white/[0.08]'
                   }`}
-                  title="3D Selenographic Surface, LOLA DEM & Cislunar Constellation"
+                  title="Global 3D Selenographic Surface, LOLA DEM & Cislunar Constellation"
                 >
                   <Moon className="w-3.5 h-3.5" />
                   <span>Lunar Surface</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setViewMode('south-pole');
+                    setCameraPreset(
+                      selectedSite.lat <= -88.8 ? 'sp-shackleton' : 'sp-overview'
+                    );
+                    setCameraNonce((n) => n + 1);
+                  }}
+                  className={`hud-btn px-3 py-1 rounded-full text-[11px] font-mono-tech flex items-center gap-1.5 cursor-pointer ${
+                    viewMode === 'south-pole'
+                      ? 'bg-cyan-400 text-[#041017] font-bold shadow-sm'
+                      : 'text-slate-300 hover:text-white hover:bg-white/[0.08]'
+                  }`}
+                  title="Dedicated High-Resolution Lunar South Pole View (NASA LROC NAC/WAC + 16-bit LOLA Polar Stereographic Clipmaps, 0° Prime Meridian Up)"
+                >
+                  <Crosshair className="w-3.5 h-3.5" />
+                  <span>South Pole</span>
                 </button>
 
                 <button
@@ -1419,10 +1662,38 @@ export function App() {
                     <button
                       key={cam.id}
                       type="button"
-                      onClick={() => triggerCamera(cam.id)}
+                      onClick={() => triggerCamera(cam.id, 'lunar-globe')}
                       className={`hud-btn px-2.5 py-0.5 rounded-full text-[11px] font-mono-tech cursor-pointer ${
                         cameraPreset === cam.id
                           ? 'bg-[#f59e0b]/25 text-[#fde68a] border border-[#f59e0b]/55 font-semibold'
+                          : 'text-slate-300 hover:text-white hover:bg-white/[0.08]'
+                      }`}
+                    >
+                      {cam.lbl}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {viewMode === 'south-pole' && (
+                <div className="flex flex-wrap items-center justify-center gap-1.5 hud-panel rounded-full px-2.5 py-1 pointer-events-auto border border-cyan-400/25">
+                  {[
+                    { id: 'sp-overview' as CameraPreset, lbl: 'Polar Cap (90°S)' },
+                    { id: 'sp-shackleton' as CameraPreset, lbl: 'Shackleton & Ridge' },
+                    { id: 'sp-malapert' as CameraPreset, lbl: 'Malapert & Haworth' },
+                    { id: 'sp-degerlache' as CameraPreset, lbl: 'de Gerlache & Shoemaker' },
+                    { id: 'sp-mouton' as CameraPreset, lbl: 'Mons Mouton & Nobile' },
+                    { id: 'site' as CameraPreset, lbl: 'Focus Pin' },
+                    { id: 'rover-locality' as CameraPreset, lbl: 'Rover Locality' },
+                    { id: 'rover-route' as CameraPreset, lbl: 'Rover Route' },
+                  ].map((cam) => (
+                    <button
+                      key={cam.id}
+                      type="button"
+                      onClick={() => triggerCamera(cam.id, 'south-pole')}
+                      className={`hud-btn px-2.5 py-0.5 rounded-full text-[11px] font-mono-tech cursor-pointer ${
+                        cameraPreset === cam.id
+                          ? 'bg-cyan-400/25 text-cyan-200 border border-cyan-400/55 font-semibold'
                           : 'text-slate-300 hover:text-white hover:bg-white/[0.08]'
                       }`}
                     >
@@ -1499,40 +1770,27 @@ export function App() {
                 </div>
               )}
 
-              {viewMode === 'lunar-globe' && roverPickMode !== 'none' && (
-                <div
-                  className={`pointer-events-auto px-3 py-1 rounded-full font-mono-tech font-bold text-xs shadow-lg flex items-center gap-2 ${
-                    roverPickMode === 'pick-checkpoint'
-                      ? 'bg-cyan-400 text-[#05070b]'
-                      : roverPickMode === 'pick-start'
-                      ? 'bg-emerald-500 text-[#05070b]'
-                      : 'bg-[#38bdf8] text-[#05070b]'
-                  }`}
-                >
-                  <span>
-                    {roverPickMode === 'pick-start'
-                      ? '⊕ STEP 2 • CLICK 3D MOON (OR A SITE) TO SET ROVER START [A]'
-                      : roverPickMode === 'pick-checkpoint'
-                      ? `◈ STEP 3 • CLICK 3D MOON TO PLACE CHECKPOINT CP ${roverCheckpoints.length + 1}`
-                      : '◈ STEP 4 • CLICK INSIDE THE RANGE FAN TO SET END POINT [B]'}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setRoverPickMode('none')}
-                    className="px-1.5 py-0.2 rounded bg-black/25 text-white text-[10px] cursor-pointer hover:bg-black/40"
-                  >
-                    Done
-                  </button>
-                </div>
+              {/* Active Time-Warp HUD Banner */}
+              {activeWarp && (
+                <KspActiveWarpBanner
+                  activeWarp={activeWarp}
+                  simTimeMs={simTimeMs}
+                  onSnapNow={() => handleSnapTime(activeWarp.targetTimeMs)}
+                  onCancel={handleCancelWarp}
+                />
               )}
             </div>
 
             {/* Bottom-Center Floating Cursor Readout + Active Heatmap OR Orbital Telemetry */}
-            {viewMode === 'lunar-globe' ? (
+            {viewMode === 'lunar-globe' || viewMode === 'south-pole' ? (
               <div className="w-full flex flex-col items-center gap-2 mt-auto">
                 {/* Hover Coordinate Readout Pill */}
                 <div className="hud-panel rounded-full px-3 py-1 text-[11px] font-mono-tech text-slate-300 flex items-center gap-2.5 pointer-events-auto">
-                  <Crosshair className="w-3.5 h-3.5 text-[#fbbf24]" />
+                  <Crosshair
+                    className={`w-3.5 h-3.5 ${
+                      viewMode === 'south-pole' ? 'text-cyan-300' : 'text-[#fbbf24]'
+                    }`}
+                  />
                   {hoverCoords ? (
                     <>
                       <span>
@@ -1558,13 +1816,31 @@ export function App() {
                           {hoverCoords.elevKm.toFixed(2)} km
                         </strong>
                       </span>
-                      <span className="hidden md:inline text-slate-400">
-                        (Click Moon to set target)
+                      {viewMode === 'south-pole' && hoverCoords.lat <= -70 && (
+                        <>
+                          <span className="text-white/20">•</span>
+                          <span>
+                            90°S{' '}
+                            <strong className="text-cyan-300">
+                              {(((90 + hoverCoords.lat) * Math.PI * 1737.4) / 180).toFixed(1)} km
+                            </strong>
+                          </span>
+                        </>
+                      )}
+                      <span className="text-white/20">•</span>
+                      <span className="text-[10px] text-emerald-300/90">
+                        {
+                          getDemResolutionAt(hoverCoords.lat, hoverCoords.lon, false)
+                            .nsPostingMeters
+                        }{' '}
+                        m/px
                       </span>
                     </>
                   ) : (
-                    <span className="text-slate-400">
-                      Drag to orbit 3D Moon • Scroll to zoom • Click any crater/ridge to inspect
+                    <span className="text-slate-400 font-mono-tech text-[10px] tracking-wide">
+                      {viewMode === 'south-pole'
+                        ? 'NASA LROC NAC/WAC + 16-bit LOLA Polar Stereographic DEM (0° Prime Meridian Up)'
+                        : 'LOLA Selenographic Terrain Model'}
                     </span>
                   )}
                 </div>
@@ -1822,7 +2098,7 @@ export function App() {
                   }}
                 />
 
-                {/* SELENE-AI Flight Co-Pilot & Optimal Touchdown Finder */}
+                {/* Flight Readiness & Optimal Touchdown Finder */}
                 <AiMissionAdvisor
                   evaluation={evaluation}
                   passes={upcomingPasses}
@@ -1884,6 +2160,34 @@ export function App() {
         simTimeMs={simTimeMs}
         roverMissionEpochMs={roverMissionEpochMs}
         onApplyTime={handleApplyMissionTime}
+      />
+
+      {/* MANUAL LUNAR SURFACE & ORBITAL LOCATION WRT SUN & EARTH MODAL */}
+      <SunEarthLocatorModal
+        isOpen={isSunEarthModalOpen}
+        onClose={() => setIsSunEarthModalOpen(false)}
+        simTimeMs={simTimeMs}
+        onApplyLandingSite={(lat, lon, customName) => {
+          handleSelectCustomPoint(lat, lon, customName);
+          triggerCamera('site');
+          setIsSunEarthModalOpen(false);
+        }}
+        onApplyRoverStart={(lat, lon, label) => {
+          setLeftTab('rover');
+          setRoverActive(true);
+          handleConfirmStartAndZoomLocality({ lat, lon, label });
+          setIsSunEarthModalOpen(false);
+        }}
+        onApplyRoverGoal={(lat, lon, label) => {
+          setLeftTab('rover');
+          setRoverActive(true);
+          handleSelectEndPoint({ lat, lon, label });
+          triggerCamera('rover-route');
+          setIsSunEarthModalOpen(false);
+        }}
+        onStartWarp={handleStartWarp}
+        onSnapTime={handleSnapTime}
+        onChangeSurfacePreview={setPreviewSunEarthPoint}
       />
     </div>
   );

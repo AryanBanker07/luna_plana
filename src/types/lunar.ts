@@ -370,7 +370,7 @@ export interface RoverTraversePlan {
   };
 }
 
-export type ViewportViewMode = 'lunar-globe' | 'earth-moon' | 'heliocentric';
+export type ViewportViewMode = 'lunar-globe' | 'south-pole' | 'earth-moon' | 'heliocentric';
 
 export interface CelestialSystemState {
   timestampMs: number;
@@ -410,6 +410,42 @@ export interface MissionEpochPreset {
   tag: string;
   description: string;
 }
+
+export interface WarpTargetOption {
+  id: string;
+  label: string;
+  subtitle: string;
+  targetTimeMs: number;
+  category: 'surface' | 'lunar-orbit' | 'heliocentric' | 'satellite';
+  recommendedView?: ViewportViewMode;
+}
+
+export interface ActiveTimeWarpState {
+  startTimeMs: number;
+  targetTimeMs: number;
+  startedRealMs: number;
+  label: string;
+  currentRateMult: number;
+  warpArrows: number; // 1..6 KSP green arrows
+}
+
+export type SunEarthSurfaceMode =
+  | 'sun-offset'
+  | 'earth-offset'
+  | 'dual-elevation';
+
+export interface SunEarthSurfaceSolution {
+  lat: number;
+  lon: number;
+  exactFeasible: boolean;
+  sunEarthSeparationDeg: number;
+  geometricSunElevDeg: number;
+  geometricEarthElevDeg: number;
+  deltaLonFromSunDeg: number;
+  deltaLonFromEarthDeg: number;
+  note?: string;
+}
+
 
 
 

@@ -8,7 +8,6 @@ import {
   FileCode,
   Layers,
   Sparkles,
-  Move,
   RotateCcw,
 } from 'lucide-react';
 import { RoverParams, RoverTraversePlan } from '../types/lunar';
@@ -266,10 +265,6 @@ export const ScientificPlotModal: React.FC<ScientificPlotModalProps> = ({
                 <h2 className="text-sm font-display font-bold uppercase tracking-wider text-white">
                   Plot Data
                 </h2>
-                <span className="flex items-center gap-1 text-[9px] font-mono-tech px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-400/30">
-                  <Move className="w-2.5 h-2.5" />
-                  <span>Movable</span>
-                </span>
                 {(offset.x !== 0 || offset.y !== 0) && (
                   <button
                     type="button"
@@ -283,7 +278,7 @@ export const ScientificPlotModal: React.FC<ScientificPlotModalProps> = ({
                 )}
               </div>
               <p className="text-[10px] font-mono-tech text-slate-400">
-                Scientific Telemetry Engine • Function over Form • Multivariable Analysis
+                Multivariable Rover Traverse & Telemetry Analysis
               </p>
             </div>
           </div>
@@ -499,11 +494,11 @@ export const ScientificPlotModal: React.FC<ScientificPlotModalProps> = ({
             </div>
           </div>
 
-          {/* SECTION 3: SCIENTIFIC FORMATTING OPTIONS (FUNCTION OVER FORM) */}
+          {/* SECTION 3: PLOT FORMATTING & DISPLAY OPTIONS */}
           <div className="p-3 rounded-xl bg-white/[0.02] border border-white/[0.08] space-y-2.5">
             <div className="text-[11px] font-semibold text-[#10b981] uppercase flex items-center gap-1.5">
               <Sparkles className="w-3.5 h-3.5" />
-              <span>3. Scientific Options (Function Over Form)</span>
+              <span>3. Plot Formatting & Display Options</span>
             </div>
 
             <div className="grid grid-cols-2 gap-3">

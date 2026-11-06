@@ -56,7 +56,7 @@ Implemented in `src/engine/celestialEphemeris.ts` and `src/components/CelestialS
 2. **Moon Around Earth — Geocentric View (`'earth-moon'`):**
    - **Tilted Rotating 3D Earth:** $23.439^\circ$ J2000 axial obliquity, continuous Greenwich Mean Sidereal Time ($\text{GMST}$) rotation, custom GLSL procedural continents/oceans/clouds, Rayleigh atmospheric scattering rim, and nightside city lights.
    - **Inclined Eccentric Lunar Orbit:** Renders the Moon's $5.145^\circ$ inclined elliptical orbit ($a = 384{,}400\text{ km}$, $e = 0.0549$) with live **Perigee**, **Apogee**, **Ascending Node ($\Omega$)**, **Descending Node ($\mho$)** (with 18.61-year nodal regression), and Earth–Moon **EM-L1 / EM-L2** Lagrange relays.
-   - **Tidally Locked 3D Moon & Live DTE Link:** Displays true world-space solar phase illumination + Earthshine, the selected landing site pin on the Moon, and a live emerald/rose **Direct-to-Earth (DTE)** comm beam. Includes a **Schematic Scale vs. True 1:1 Physical Scale ($60.3\,R_\oplus$)** toggle.
+   - **Tidally Locked 3D Moon, Leader-Arrow Callout Placards & Live DTE Link:** Displays true world-space solar phase illumination + Earthshine/limb rim, the selected landing site pin on the Moon, and a live emerald/rose **Direct-to-Earth (DTE)** comm beam. Includes a **Schematic Scale vs. True 1:1 Physical Scale ($60.3\,R_\oplus$)** toggle backed by screen-space SVG leader-arrow + info placards (`OrbitalCalloutPlacard`) that pinpoint sub-pixel 1:1 bodies and route collinear markers (`EM-L1`, `Moon`, `EM-L2`) into non-overlapping quadrants without occluding the 3D spheres.
 3. **Earth & Moon Around Sun — Heliocentric View (`'heliocentric'`):**
    - **Animated 3D Sun & Corona:** Dynamic solar granulation/limb-darkening photosphere + additive corona at the J2000 Ecliptic origin.
    - **1 AU Elliptical Orbit & Seasons:** Renders Earth's eccentric heliocentric orbit ($e_\oplus = 0.01671$) with stationary inertial **Perihelion (~Jan 3)**, **Aphelion (~Jul 4)**, **March/September Equinox**, and **June/December Solstice** markers.
@@ -69,5 +69,48 @@ Implemented in `src/engine/celestialEphemeris.ts` and `src/components/CelestialS
 Implemented in `src/components/MissionEpochModal.tsx`, `src/engine/celestialEphemeris.ts`, and `src/components/RoverMissionPlanner.tsx`:
 - **Arbitrary Past & Future Epochs (`1800`–`2300` UTC):** All analytical ephemerides (`computeCelestialSystemState`, `computeSunEarthSelenographic`, `propagateSatellite`, and `simulatePathPhysics`) evaluate continuous offsets from `J2000.0` (`2000-01-01T12:00:00Z`) with negative-modulo wrapping so past historical missions (e.g., **Apollo 11** `1969-07-20`, **Chandrayaan-3** `2023-08-23`), present real-time UTC (`Now`), and future **Artemis III / IV / Base Camp (`2027`–`2032+`)** windows propagate identically.
 - **Movable Mission Epoch Selector & Inline Rover Epoch Card:** Operators can set exact Year, Month, Day, and `HH:MM` UTC from either the top header clock or directly inside the Rover Mission Planner without live-clock input clobbering, plus step by $\pm 6\text{h}$, $\pm 1\text{d}$, $\pm 1\text{ Lunation}$ ($29.53\text{ d}$), or $\pm 1\text{–}10\text{ Yr}$ and warp orbital playback up to `1d/s` and `15d/s`.
+
+---
+
+## 7. High-Precision Orbital `"Warp To"` & Click-on-Orbit `"Warp Here"`
+
+Implemented across `src/engine/celestialEphemeris.ts`, `src/engine/selenography.ts`, `src/components/KspWarpMenu.tsx`, `src/components/CelestialSystem3D.tsx`, `src/components/LunarGlobe3D.tsx`, and `src/App.tsx`:
+
+1. **Click-on-Orbit `"Warp Here"` in All 3D Views:**
+   - Invisible Three.js `TubeGeometry` raycast hit-corridors wrap the Moon's 3D inclined elliptical orbit (`'earth-moon'`), Earth's 1 AU heliocentric orbit (`'heliocentric'`), and all 5 cislunar satellite orbits (`'lunar-globe'`), alongside clickable orbital milestone markers (**Perigee**, **Apogee**, **Ascending/Descending Nodes**, **Perihelion**, **Aphelion**, **Equinoxes & Solstices**).
+   - Hovering previews a ghost reticle along the trajectory; clicking locks an emerald maneuver/target node (`◈`) displaying exact ETA (`T − …`) with **`▸▸▸ Warp Here`** and **`⚡ Snap`** triggers.
+2. **Analytical & Bisection Event Root-Finders:**
+   - **Orbital Milestones (`celestialEphemeris.ts`):** Fixed-slope Newton iteration (`solveNextMoonGeocentricLonTime`, `solveNextMoonElongationTime`, `solveNextEarthHelioLonTime`) and golden-section / zero-crossing search (`solveNextLunarApsisOrNodeTime`) solve upcoming Perigee, Apogee, $\Omega$/$\mho$ Nodes, New/1Q/Full/3Q Moon phases, Equinoxes/Solstices, and Perihelion/Aphelion to sub-second precision.
+   - **Keplerian Satellite Orbit Points (`solveNextSatelliteOrbitPointTime`):** Projects any clicked 3D point onto the satellite's orbital perifocal basis $(\hat{\mathbf{p}}, \hat{\mathbf{q}})$ to recover true anomaly $\nu_{\text{target}} \to E_{\text{target}} \to M_{\text{target}}$ and exact wait time $\Delta t = \Delta M / n$.
+   - **Topographic Surface Events (`computeSiteSurfaceWarpTargets`):** Scans a 30-day synodic cycle against the site's 360° LOLA horizon mask using 22-iteration bisection to pinpoint local **Sunrise**, **Peak Solar Elevation**, **Sunset**, and **Direct-to-Earth (DTE) Rise**.
+3. **Proportional Auto-Warp Controller (`App.tsx` + `KspActiveWarpBanner`):**
+   - Smoothly eases in over $0.35\text{ s}$ to cruise rate $\dot{t}_{\text{peak}} = \Delta T / 2.4\text{ s}$ while bounding speed by proportional deceleration $\dot{t}_{\text{decel}} = \max(0.035\,\Delta T,\; 2.8\,|t_{\text{target}} - t|)$, updating green chevrons (`▸▸▸▸▸▸`) and auto-pausing cleanly at `targetTimeMs` without overshoot (`Esc` or `Stop` aborts immediately).
+
+---
+
+## 8. Manual Location Selection WRT Sun & Earth (Surface & Orbital)
+
+Implemented in `src/components/SunEarthLocatorModal.tsx`, `src/engine/selenography.ts` (`solveSurfaceLocationWrtSunEarth`), and `src/engine/celestialEphemeris.ts`:
+
+1. **Lunar Surface Location WRT Sun & Earth:**
+   - **Sub-Solar Offset Frame (`'sun-offset'`):** Places a target at $(\phi,\; \lambda_{\odot}(t) + \Delta\lambda_{\odot})$, where $\Delta\lambda_{\odot} = -90^\circ$ is the **Morning / Sunrise Terminator** (since $\lambda_{\odot}$ drifts Westward with time), $0^\circ$ is **Sub-Solar Noon**, $+90^\circ$ is the **Evening / Sunset Terminator**, and $180^\circ$ is **Anti-Solar Midnight**.
+   - **Sub-Earth Libration Offset Frame (`'earth-offset'`):** Places a target at $(\phi_{\oplus}(t) + \Delta\phi_{\oplus},\; \lambda_{\oplus}(t) + \Delta\lambda_{\oplus})$ relative to the instantaneous optical libration center (including **Polar DTE Limb** and **Far-Side Radio-Quiet Anti-Earth** presets).
+   - **Closed-Form Joint Sun & Earth Elevation Solver (`'dual-elevation'`):** Solves $\hat{\mathbf{n}} \cdot \hat{\mathbf{s}} = \sin h_{\odot}$ and $\hat{\mathbf{n}} \cdot \hat{\mathbf{e}} = \sin h_{\oplus}$ analytically on the unit sphere via:
+     $$\mathbf{v}_{\parallel} = \alpha\hat{\mathbf{s}} + \beta\hat{\mathbf{e}}, \qquad \hat{\mathbf{n}} = \mathbf{v}_{\parallel} \pm \sqrt{1 - \|\mathbf{v}_{\parallel}\|^2}\,\frac{\hat{\mathbf{s}} \times \hat{\mathbf{e}}}{\|\hat{\mathbf{s}} \times \hat{\mathbf{e}}\|}$$
+     selecting the preferred hemisphere (`South` vs. `North`) and clamping gracefully onto the Sun–Earth great circle if $(h_{\odot}, h_{\oplus})$ exceeds the instantaneous Sun–Earth angular separation.
+   - Renders a live 3D cyan reticle (`⌖`) with `☉ Sub-Solar` and `⊕ Sub-Earth` reference pins on the 3D Moon and applies in one click to **Landing Site Pin**, **Rover Start [A]**, or **Rover Goal [B]**.
+2. **Orbital Position WRT Sun & Earth:**
+   - Interactive SVG Sun–Earth–Moon phase dial and manual sliders for **Moon Elongation WRT Sun–Earth Line ($0^\circ\text{–}359^\circ$)** and **Earth Heliocentric Longitude $\lambda_{\oplus}$ ($0^\circ\text{–}359^\circ$)** solve the exact next UTC epoch and trigger **Warp** or **Instant Snap**.
+
+---
+
+## 9. Streamlined Aerospace Telemetry Interface & Decluttering
+
+To eliminate AI-generated artifacts, tutorial hand-holding, and game branding in favor of authentic NASA flight operations aesthetics:
+- **Badge Removal:** Removed all `[✢ Movable]` badges across all draggable modals (`SunEarthLocatorModal`, `MissionEpochModal`, `ScientificPlotModal`).
+- **Nomenclature Standardization:** Replaced `"KSP Warp"` with standard `"Warp"` and `"Time Warp"` across buttons, tooltips, dialogs, and orbital placards.
+- **Flight Ops Telemetry Synthesis:** Replaced the AI chatbot co-pilot box with the deterministic `Flight Readiness & Touchdown Windows` card, presenting instant Go/No-Go status, optimal multi-hour illumination windows, and terrain/comms/power breakdown without LLM overhead or prompt clutter.
+- **HUD Decluttering:** Removed intrusive center-screen rover step banners, redundant `[NASA SPACE APPS 2026]` pill, `[RELAY]` badges, and instructional hover text (`Drag to orbit...`, `Click → ▸▸▸ Warp`).
+
 
 

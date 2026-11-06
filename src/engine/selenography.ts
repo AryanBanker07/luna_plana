@@ -10,11 +10,14 @@ import {
   LunarSatellite,
   OptimalWindowRecommendation,
   ReadinessStatus,
-  SatelliteLiveState,
+   SatelliteLiveState,
   SatellitePassWindow,
   SiteEvaluation,
   SkyBodyHorizontal,
+  SunEarthSurfaceMode,
+  SunEarthSurfaceSolution,
   TimelineSample,
+  WarpTargetOption,
 } from '../types/lunar';
 
 const DEG2RAD = Math.PI / 180;
@@ -25,7 +28,9 @@ const J2000_MS = Date.UTC(2000, 0, 1, 12, 0, 0);
 // Tier 0: 2048x1024 8-bit fast boot
 // Tier 1: 2880x1440 16-bit Global LOLA DEM (0.5m vertical precision)
 // Tier 2: 5760x320  16-bit South Pole 80°S-90°S Strip (16 px/deg, 0.5m vertical precision)
-// Tier 3: 1600x1600 16-bit NASA PGDA Artemis III Site 01 Patch (10 m/px, 0.1m vertical precision!)
+// Tier 3A: 2048x2048 16-bit Polar Stereographic Artemis Cap (±155 km, ~151 m/px, 0.3m vertical)
+// Tier 3B: 2048x2048 16-bit Polar Stereographic Shackleton Core (±36 km, ~35 m/px, 0.3m vertical)
+// Tier 4: 1600x1600 16-bit NASA PGDA Artemis III Site 01 Patch (10 m/px, 0.1m vertical precision!)
 let lolaDemBuffer: Float32Array | null = null;
 let lolaWidth = 1024;
 let lolaHeight = 512;
@@ -34,6 +39,14 @@ let lolaIs16Bit = false;
 let southPole16Buffer: Float32Array | null = null; // 5760x320 covering lat [-80, -90]
 let spWidth = 5760;
 let spHeight = 320;
+
+let spArtemisBuffer: Float32Array | null = null; // 2048x2048 stereographic ±155 km
+let spArtemisSize = 2048;
+const SP_ARTEMIS_HALF_M = 155000.0;
+
+let spInnerBuffer: Float32Array | null = null; // 2048x2048 stereographic ±36 km
+let spInnerSize = 2048;
+const SP_INNER_HALF_M = 36000.0;
 
 let site01PatchBuffer: Float32Array | null = null; // 1600x1600 stereographic 10m/px
 let site01Size = 1600;
@@ -98,6 +111,34 @@ export function initLolaDemSampler(url = '/textures/lola_dem.jpg'): void {
       spWidth = width;
       spHeight = height;
       southPole16Buffer = buf;
+      demListeners.forEach((cb) => cb());
+    })
+    .catch(() => {});
+
+  // 2B. High-Res 2048x2048 Polar Stereographic Artemis Zone (±155 km, ~151 m/px, 0.3m vertical)
+  loadRgbaImageData('/textures/lola_sp_artemis_16bit.png')
+    .then(({ data, width }) => {
+      const buf = new Float32Array(width * width);
+      for (let i = 0; i < width * width; i++) {
+        const dn = (data[i * 4] << 8) | data[i * 4 + 1];
+        buf[i] = (dn / 65535.0) * 19.67 - 8.98;
+      }
+      spArtemisSize = width;
+      spArtemisBuffer = buf;
+      demListeners.forEach((cb) => cb());
+    })
+    .catch(() => {});
+
+  // 2C. Ultra-High-Res 2048x2048 Polar Stereographic Shackleton Core (±36 km, ~35 m/px, 0.3m vertical)
+  loadRgbaImageData('/textures/lola_sp_inner_16bit.png')
+    .then(({ data, width }) => {
+      const buf = new Float32Array(width * width);
+      for (let i = 0; i < width * width; i++) {
+        const dn = (data[i * 4] << 8) | data[i * 4 + 1];
+        buf[i] = (dn / 65535.0) * 19.67 - 8.98;
+      }
+      spInnerSize = width;
+      spInnerBuffer = buf;
       demListeners.forEach((cb) => cb());
     })
     .catch(() => {});
@@ -239,6 +280,30 @@ function isInsideSite01Patch(latDeg: number, lonDeg: number): { inside: boolean;
   return { inside, ix, iy };
 }
 
+function samplePolarStereoBuffer(
+  buf: Float32Array,
+  size: number,
+  halfExtentM: number,
+  X: number,
+  Y: number
+): number | null {
+  const margin = halfExtentM * 0.985;
+  if (Math.abs(X) >= margin || Math.abs(Y) >= margin) return null;
+  const px = (2.0 * halfExtentM) / size;
+  const ix = (X + halfExtentM) / px - 0.5;
+  const iy = (halfExtentM - Y) / px - 0.5;
+  if (ix < 1 || ix >= size - 2 || iy < 1 || iy >= size - 2) return null;
+  const x0 = Math.floor(ix);
+  const y0 = Math.floor(iy);
+  const fx = ix - x0;
+  const fy = iy - y0;
+  const e00 = buf[y0 * size + x0];
+  const e10 = buf[y0 * size + (x0 + 1)];
+  const e01 = buf[(y0 + 1) * size + x0];
+  const e11 = buf[(y0 + 1) * size + (x0 + 1)];
+  return (1 - fx) * (1 - fy) * e00 + fx * (1 - fy) * e10 + (1 - fx) * fy * e01 + fx * fy * e11;
+}
+
 /**
  * Sample NASA LOLA Elevation (km relative to 1737.4 km mean radius) at any (lat, lon)
  * Automatically selects the highest-resolution loaded DEM tier at the queried coordinate!
@@ -247,7 +312,7 @@ export function sampleElevationKm(latDeg: number, lonDeg: number): number {
   const clampedLat = Math.max(-89.9995, Math.min(89.9995, latDeg));
   const normLon = normalizeLon(lonDeg);
 
-  // TIER 3: 10 m/px 16-bit NASA GSFC PGDA Artemis III Site 01 Patch (Shackleton Connecting Ridge)
+  // TIER 4: 10 m/px 16-bit NASA GSFC PGDA Artemis III Site 01 Patch (Shackleton Connecting Ridge)
   const patchCheck = isInsideSite01Patch(clampedLat, normLon);
   if (patchCheck.inside && site01PatchBuffer) {
     const { ix, iy } = patchCheck;
@@ -265,6 +330,19 @@ export function sampleElevationKm(latDeg: number, lonDeg: number): number {
       (1 - fx) * fy * e01 +
       fx * fy * e11
     );
+  }
+
+  // TIER 3B & 3A: High-Res Polar Stereographic LOLA Clipmaps (±36 km at 35 m/px & ±155 km at 151 m/px)
+  if (clampedLat <= -84.2 && (spInnerBuffer || spArtemisBuffer)) {
+    const { X, Y } = latLonToSouthPolarStereoMeters(clampedLat, normLon);
+    if (spInnerBuffer) {
+      const innerVal = samplePolarStereoBuffer(spInnerBuffer, spInnerSize, SP_INNER_HALF_M, X, Y);
+      if (innerVal !== null) return innerVal;
+    }
+    if (spArtemisBuffer) {
+      const artVal = samplePolarStereoBuffer(spArtemisBuffer, spArtemisSize, SP_ARTEMIS_HALF_M, X, Y);
+      if (artVal !== null) return artVal;
+    }
   }
 
   // TIER 2: 16 px/deg (5760x320) 16-bit NASA LOLA South Pole Strip (80°S to 90°S, 0.5m vertical precision)
@@ -338,7 +416,7 @@ export function getDemResolutionAt(
   const patch = isInsideSite01Patch(latDeg, lonDeg);
   if (patch.inside && site01PatchBuffer) {
     return {
-      tierName: 'Tier 3 • NASA PGDA Artemis Site 01 Polar Stereographic LOLA',
+      tierName: 'Tier 4 • NASA PGDA Artemis Site 01 Polar Stereographic LOLA',
       nsPostingMeters: 10,
       ewPostingMeters: 10,
       verticalPrecisionMeters: 0.1,
@@ -346,6 +424,40 @@ export function getDemResolutionAt(
       isAdequateForMeterScale: true,
       note: 'True 10 m/px (0.1 m vertical) self-consistent LOLA laser altimetry mosaic — directly resolves 20–50 m craters and ridge scarps for rover pathfinding.',
     };
+  }
+
+  if (latDeg <= -84.2) {
+    const { X, Y } = latLonToSouthPolarStereoMeters(latDeg, normalizeLon(lonDeg));
+    if (
+      spInnerBuffer &&
+      Math.abs(X) < SP_INNER_HALF_M * 0.985 &&
+      Math.abs(Y) < SP_INNER_HALF_M * 0.985
+    ) {
+      return {
+        tierName: 'Tier 3B • NASA LOLA LDEM_875S Polar Stereographic Core',
+        nsPostingMeters: 35,
+        ewPostingMeters: 35,
+        verticalPrecisionMeters: 0.3,
+        subGridModelActive,
+        isAdequateForMeterScale: true,
+        note: 'High-resolution 35 m × 35 m (16-bit, 0.3 m vertical) Polar Stereographic LOLA DEM resolving Shackleton, Connecting Ridge, and inner PSR walls with zero polar pinch.',
+      };
+    }
+    if (
+      spArtemisBuffer &&
+      Math.abs(X) < SP_ARTEMIS_HALF_M * 0.985 &&
+      Math.abs(Y) < SP_ARTEMIS_HALF_M * 0.985
+    ) {
+      return {
+        tierName: 'Tier 3A • NASA LOLA LDEM_85S Polar Stereographic Artemis Cap',
+        nsPostingMeters: 151,
+        ewPostingMeters: 151,
+        verticalPrecisionMeters: 0.3,
+        subGridModelActive,
+        isAdequateForMeterScale: subGridModelActive,
+        note: '151 m × 151 m (16-bit, 0.3 m vertical) Polar Stereographic LOLA DEM across 85°S–90°S resolving Shoemaker, Faustini, Haworth, de Gerlache, Malapert & Nobile.',
+      };
+    }
   }
 
   const cosLat = Math.max(0.012, Math.cos(latDeg * DEG2RAD));
@@ -1345,5 +1457,301 @@ export function findOptimalTouchdownWindows(
   }
 
   return candidates.sort((a, b) => b.score - a.score).slice(0, 3);
+}
+
+/**
+ * Given a clicked sample along `sampleSatelliteOrbitCurve` (eccentric anomaly E = (frac * 2π)),
+ * compute the exact next timestamp (> fromTimeMs) when the spacecraft arrives at that orbital point.
+ */
+export function solveNextSatelliteOrbitPointTime(
+  sat: LunarSatellite,
+  fromTimeMs: number,
+  orbitFraction01: number
+): number {
+  const Etarget = ((orbitFraction01 % 1) + 1) % 1 * 2 * Math.PI;
+  const e = sat.eccentricity;
+  let Mtarget = (Etarget - e * Math.sin(Etarget)) % (2 * Math.PI);
+  if (Mtarget < 0) Mtarget += 2 * Math.PI;
+
+  const a = sat.semiMajorAxisKm;
+  const n = Math.sqrt(MOON_MU_KM3_S2 / (a * a * a)); // rad/s
+  const dtSecNow = (fromTimeMs - Date.UTC(2026, 10, 4, 0, 0, 0)) / 1000;
+  const M0 = sat.meanAnomalyEpochDeg * DEG2RAD;
+  let Mnow = (M0 + n * dtSecNow) % (2 * Math.PI);
+  if (Mnow < 0) Mnow += 2 * Math.PI;
+
+  let dM = (Mtarget - Mnow) % (2 * Math.PI);
+  if (dM < 0) dM += 2 * Math.PI;
+  if (dM < 0.015) dM += 2 * Math.PI;
+
+  const waitSec = dM / n;
+  return Math.round(fromTimeMs + waitSec * 1000);
+}
+
+/**
+ * Compute upcoming KSP "Warp To" surface events (Local Sunrise, Solar Peak, Sunset, DTE Earthrise)
+ * for the selected landing site using 360° LOLA horizon ray-tracing + bisection.
+ */
+export function computeSiteSurfaceWarpTargets(
+  site: LandingSite,
+  fromTimeMs: number
+): WarpTargetOption[] {
+  const elevKm = site.elevationKm ?? sampleElevationKm(site.lat, site.lon);
+  const horizon = computeHorizonProfileDeg(site.lat, site.lon, 2.0);
+  const results: WarpTargetOption[] = [];
+
+  const evalSunClearance = (tMs: number): { margin: number; el: number } => {
+    const se = computeSunEarthSelenographic(tMs);
+    const topo = computeTopocentricAzEl(
+      site.lat,
+      site.lon,
+      elevKm + 0.002,
+      se.subSolarLat,
+      se.subSolarLon,
+      149597870
+    );
+    const mask = interpolateHorizonAtAzimuth(horizon, topo.azimuthDeg) - 0.26;
+    return { margin: topo.elevationDeg - mask, el: topo.elevationDeg };
+  };
+
+  const evalEarthClearance = (tMs: number): { margin: number; el: number } => {
+    const se = computeSunEarthSelenographic(tMs);
+    const topo = computeTopocentricAzEl(
+      site.lat,
+      site.lon,
+      elevKm + 0.002,
+      se.subEarthLat,
+      se.subEarthLon,
+      se.earthDistanceKm
+    );
+    const mask = Math.max(interpolateHorizonAtAzimuth(horizon, topo.azimuthDeg), 1.0);
+    return { margin: topo.elevationDeg - mask, el: topo.elevationDeg };
+  };
+
+  const stepMs = 3 * 3600 * 1000; // 3-hour scan over 30 days
+  const totalSteps = 242;
+
+  let sunriseMs: number | null = null;
+  let sunsetMs: number | null = null;
+  let dteRiseMs: number | null = null;
+  let peakSunMs = fromTimeMs;
+  let peakSunEl = -90;
+
+  let prevSun = evalSunClearance(fromTimeMs);
+  let prevEarth = evalEarthClearance(fromTimeMs);
+
+  const bisectCrossing = (
+    fn: (ms: number) => { margin: number },
+    t0: number,
+    t1: number,
+    rising: boolean
+  ): number => {
+    let lo = t0;
+    let hi = t1;
+    for (let k = 0; k < 14; k++) {
+      const mid = 0.5 * (lo + hi);
+      const m = fn(mid).margin;
+      if ((rising && m < 0) || (!rising && m >= 0)) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+    return Math.round(hi);
+  };
+
+  for (let i = 1; i <= totalSteps; i++) {
+    const t = fromTimeMs + i * stepMs;
+    const curSun = evalSunClearance(t);
+    const curEarth = evalEarthClearance(t);
+
+    if (curSun.margin > 0 && curSun.el > peakSunEl) {
+      peakSunEl = curSun.el;
+      peakSunMs = t;
+    }
+
+    if (sunriseMs === null && prevSun.margin <= 0 && curSun.margin > 0) {
+      sunriseMs = bisectCrossing(evalSunClearance, t - stepMs, t, true);
+    }
+    if (sunsetMs === null && prevSun.margin > 0 && curSun.margin <= 0) {
+      sunsetMs = bisectCrossing(evalSunClearance, t - stepMs, t, false);
+    }
+    if (dteRiseMs === null && prevEarth.margin <= 0 && curEarth.margin > 0) {
+      dteRiseMs = bisectCrossing(evalEarthClearance, t - stepMs, t, true);
+    }
+
+    prevSun = curSun;
+    prevEarth = curEarth;
+  }
+
+  const shortSite = site.name.split(' (')[0];
+
+  if (sunriseMs !== null) {
+    results.push({
+      id: 'site-sunrise',
+      label: `Local Sunrise at ${shortSite}`,
+      subtitle: 'Sun clears local 360° LOLA topographic horizon rim',
+      targetTimeMs: sunriseMs,
+      category: 'surface',
+      recommendedView: 'lunar-globe',
+    });
+  }
+
+  if (peakSunEl > 0 && peakSunMs > fromTimeMs + 1800000) {
+    results.push({
+      id: 'site-noon',
+      label: `Peak Solar Elevation (+${peakSunEl.toFixed(1)}°)`,
+      subtitle: `Maximum solar array incidence at ${shortSite}`,
+      targetTimeMs: peakSunMs,
+      category: 'surface',
+      recommendedView: 'lunar-globe',
+    });
+  }
+
+  if (sunsetMs !== null) {
+    results.push({
+      id: 'site-sunset',
+      label: `Local Sunset at ${shortSite}`,
+      subtitle: 'Onset of lunar night / topographic shadow behind rim',
+      targetTimeMs: sunsetMs,
+      category: 'surface',
+      recommendedView: 'lunar-globe',
+    });
+  }
+
+  if (dteRiseMs !== null) {
+    results.push({
+      id: 'site-dte-rise',
+      label: `Next DTE Earthrise at ${shortSite}`,
+      subtitle: 'Optical libration lifts Earth above local horizon mask',
+      targetTimeMs: dteRiseMs,
+      category: 'surface',
+      recommendedView: 'lunar-globe',
+    });
+  }
+
+  return results.sort((a, b) => a.targetTimeMs - b.targetTimeMs);
+}
+
+/**
+ * Solve for a Lunar Surface Location (lat, lon) specified manually WITH RESPECT TO THE SUN AND EARTH!
+ * Supports:
+ *  - 'sun-offset': Offset Δλ from Sub-Solar Longitude (0° = Noon, -90° = Sunrise Terminator, +90° = Sunset) + Target Lat
+ *  - 'earth-offset': Offset Δλ, Δφ from Sub-Earth Libration Zenith (0° = Peak DTE, ±90° = Grazing Limb, ±180° = Far-Side Quiet)
+ *  - 'dual-elevation': Exact closed-form 3D vector intersection for desired Sun Elevation + desired Earth Elevation!
+ */
+export function solveSurfaceLocationWrtSunEarth(params: {
+  timeMs: number;
+  mode: SunEarthSurfaceMode;
+  deltaLonFromSunDeg: number;
+  deltaLonFromEarthDeg: number;
+  deltaLatFromEarthDeg: number;
+  targetLatDeg: number;
+  useRelativeEarthLat: boolean;
+  desiredSunElevDeg: number;
+  desiredEarthElevDeg: number;
+  preferredHemisphere: 'south' | 'north';
+}): SunEarthSurfaceSolution {
+  const se = computeSunEarthSelenographic(params.timeMs);
+  const [sx, sy, sz] = latLonToCartesian(se.subSolarLat, se.subSolarLon, 1);
+  const [ex, ey, ez] = latLonToCartesian(se.subEarthLat, se.subEarthLon, 1);
+
+  const dotSE = Math.max(-1, Math.min(1, sx * ex + sy * ey + sz * ez));
+  const sunEarthSeparationDeg = Number((Math.acos(dotSE) * RAD2DEG).toFixed(1));
+
+  let lat = 0;
+  let lon = 0;
+  let exactFeasible = true;
+  let note: string | undefined;
+
+  if (params.mode === 'sun-offset') {
+    lat = Math.max(-89.9, Math.min(89.9, params.targetLatDeg));
+    lon = normalizeLon(se.subSolarLon + params.deltaLonFromSunDeg);
+  } else if (params.mode === 'earth-offset') {
+    const rawLat = params.useRelativeEarthLat
+      ? se.subEarthLat + params.deltaLatFromEarthDeg
+      : params.targetLatDeg;
+    lat = Math.max(-89.9, Math.min(89.9, rawLat));
+    lon = normalizeLon(se.subEarthLon + params.deltaLonFromEarthDeg);
+  } else {
+    // 'dual-elevation': Solve n · s = sin(h_sun), n · e = sin(h_earth), ||n|| = 1
+    const a = Math.sin(Math.max(-90, Math.min(90, params.desiredSunElevDeg)) * DEG2RAD);
+    const b = Math.sin(Math.max(-90, Math.min(90, params.desiredEarthElevDeg)) * DEG2RAD);
+    const denom = 1 - dotSE * dotSE;
+
+    if (denom > 1e-5) {
+      const alpha = (a - b * dotSE) / denom;
+      const beta = (b - a * dotSE) / denom;
+      const vx = alpha * sx + beta * ex;
+      const vy = alpha * sy + beta * ey;
+      const vz = alpha * sz + beta * ez;
+      const lenSq = vx * vx + vy * vy + vz * vz;
+
+      if (lenSq <= 1.0002) {
+        const rem = Math.sqrt(Math.max(0, 1 - lenSq));
+        // Cross product w = (s x e) / ||s x e||
+        const cx = sy * ez - sz * ey;
+        const cy = sz * ex - sx * ez;
+        const cz = sx * ey - sy * ex;
+        const cNorm = Math.hypot(cx, cy, cz) || 1;
+        const wx = cx / cNorm;
+        const wy = cy / cNorm;
+        const wz = cz / cNorm;
+
+        const p1: [number, number, number] = [vx + rem * wx, vy + rem * wy, vz + rem * wz];
+        const p2: [number, number, number] = [vx - rem * wx, vy - rem * wy, vz - rem * wz];
+        const chosen =
+          params.preferredHemisphere === 'south'
+            ? p1[1] <= p2[1]
+              ? p1
+              : p2
+            : p1[1] >= p2[1]
+            ? p1
+            : p2;
+        const ll = cartesianToLatLon(chosen[0], chosen[1], chosen[2]);
+        lat = ll.lat;
+        lon = normalizeLon(ll.lon);
+      } else {
+        // Closest feasible point on the Sun-Earth great circle
+        exactFeasible = false;
+        const vNorm = Math.hypot(vx, vy, vz) || 1;
+        const ll = cartesianToLatLon(vx / vNorm, vy / vNorm, vz / vNorm);
+        lat = ll.lat;
+        lon = normalizeLon(ll.lon);
+        note = `Sun & Earth are currently ${sunEarthSeparationDeg}° apart; projected to closest feasible point on the Sun–Earth great circle.`;
+      }
+    } else {
+      // Sun and Earth nearly collinear (New Moon ~180° or Full Moon ~0°)
+      exactFeasible = Math.abs(a - b * dotSE) < 0.03;
+      const zAngleRad = Math.acos(Math.max(-1, Math.min(1, a)));
+      const az = params.preferredHemisphere === 'south' ? 180 : 0;
+      const pt = stepAlongBearing(se.subSolarLat, se.subSolarLon, az, zAngleRad * RAD2DEG);
+      lat = pt.lat;
+      lon = pt.lon;
+      if (!exactFeasible) {
+        note = `Sun & Earth are nearly aligned (${sunEarthSeparationDeg}° separation); matched target Sun elevation.`;
+      }
+    }
+  }
+
+  const [nx, ny, nz] = latLonToCartesian(lat, lon, 1);
+  const geometricSunElevDeg = Number(
+    (Math.asin(Math.max(-1, Math.min(1, nx * sx + ny * sy + nz * sz))) * RAD2DEG).toFixed(1)
+  );
+  const geometricEarthElevDeg = Number(
+    (Math.asin(Math.max(-1, Math.min(1, nx * ex + ny * ey + nz * ez))) * RAD2DEG).toFixed(1)
+  );
+
+  return {
+    lat: Number(lat.toFixed(2)),
+    lon: Number(lon.toFixed(2)),
+    exactFeasible,
+    sunEarthSeparationDeg,
+    geometricSunElevDeg,
+    geometricEarthElevDeg,
+    deltaLonFromSunDeg: Number(normalizeLon(lon - se.subSolarLon).toFixed(1)),
+    deltaLonFromEarthDeg: Number(normalizeLon(lon - se.subEarthLon).toFixed(1)),
+    note,
+  };
 }
 

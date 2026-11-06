@@ -7,7 +7,9 @@ import {
   latLonToCartesian,
   sampleElevationKm,
   sampleSatelliteOrbitCurve,
+  solveNextSatelliteOrbitPointTime,
 } from '../engine/selenography';
+import { formatWarpDelta } from '../engine/celestialEphemeris';
 import {
   CandidateCorridorPath,
   HeatmapMode,
@@ -30,9 +32,155 @@ const HEATMAP_INDEX: Record<HeatmapMode, number> = {
   dte: 6,
 };
 
+function createPolarRefinedSphereGeometry(): THREE.BufferGeometry {
+  const widthSegs = 320;
+  const globalRings = 120; // 90°N down to 78°S
+  const polarRings = 120; // 78°S down to 90°S (~0.10° = 3.0 km vertex spacing!)
+  const totalRings = globalRings + polarRings;
+  const thetaSplit = ((90 + 78) / 180) * Math.PI; // 168° colatitude from +Y North Pole
+
+  const thetas = new Float64Array(totalRings + 1);
+  for (let iy = 0; iy <= totalRings; iy++) {
+    if (iy <= globalRings) {
+      thetas[iy] = (iy / globalRings) * thetaSplit;
+    } else {
+      const t = (iy - globalRings) / polarRings;
+      thetas[iy] = thetaSplit + t * (Math.PI - thetaSplit);
+    }
+  }
+
+  const vertCount = (widthSegs + 1) * (totalRings + 1);
+  const positions = new Float32Array(vertCount * 3);
+  const normals = new Float32Array(vertCount * 3);
+  const uvs = new Float32Array(vertCount * 2);
+
+  let pIdx = 0;
+  let uvIdx = 0;
+  for (let iy = 0; iy <= totalRings; iy++) {
+    const theta = thetas[iy];
+    const sinT = Math.sin(theta);
+    const cosT = Math.cos(theta);
+    const v = 1.0 - theta / Math.PI;
+
+    for (let ix = 0; ix <= widthSegs; ix++) {
+      const u = ix / widthSegs;
+      const phi = u * Math.PI * 2.0;
+      const x = -Math.cos(phi) * sinT;
+      const y = cosT;
+      const z = Math.sin(phi) * sinT;
+
+      positions[pIdx] = x;
+      positions[pIdx + 1] = y;
+      positions[pIdx + 2] = z;
+
+      normals[pIdx] = x;
+      normals[pIdx + 1] = y;
+      normals[pIdx + 2] = z;
+      pIdx += 3;
+
+      uvs[uvIdx] = u;
+      uvs[uvIdx + 1] = v;
+      uvIdx += 2;
+    }
+  }
+
+  const indices = new Uint32Array(widthSegs * totalRings * 6);
+  let iIdx = 0;
+  const stride = widthSegs + 1;
+  for (let iy = 0; iy < totalRings; iy++) {
+    for (let ix = 0; ix < widthSegs; ix++) {
+      const a = iy * stride + (ix + 1);
+      const b = iy * stride + ix;
+      const c = (iy + 1) * stride + ix;
+      const d = (iy + 1) * stride + (ix + 1);
+
+      if (iy !== 0) {
+        indices[iIdx++] = a;
+        indices[iIdx++] = b;
+        indices[iIdx++] = d;
+      }
+      if (iy !== totalRings - 1) {
+        indices[iIdx++] = b;
+        indices[iIdx++] = c;
+        indices[iIdx++] = d;
+      }
+    }
+  }
+
+  const geom = new THREE.BufferGeometry();
+  geom.setIndex(new THREE.BufferAttribute(indices.subarray(0, iIdx), 1));
+  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geom.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  return geom;
+}
+
+const POLAR_SAMPLER_GLSL = /* glsl */ `
+  uniform sampler2D uSpWideDem;
+  uniform sampler2D uSpArtemisDem;
+  uniform sampler2D uSpInnerDem;
+
+  float unpackDem16(vec4 c) {
+    return (c.r * 65280.0 + c.g * 255.0) / 65535.0;
+  }
+
+  float sampleDem16Bilinear(sampler2D tex, vec2 uv, float texSize) {
+    vec2 p = clamp(uv, 0.0005, 0.9995) * texSize - 0.5;
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    float inv = 1.0 / texSize;
+    float v00 = unpackDem16(texture2D(tex, (i + vec2(0.5, 0.5)) * inv));
+    float v10 = unpackDem16(texture2D(tex, (i + vec2(1.5, 0.5)) * inv));
+    float v01 = unpackDem16(texture2D(tex, (i + vec2(0.5, 1.5)) * inv));
+    float v11 = unpackDem16(texture2D(tex, (i + vec2(1.5, 1.5)) * inv));
+    return mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y);
+  }
+
+  vec2 unitNormalToEquirectUv(vec3 dir) {
+    float lat = asin(clamp(dir.y, -1.0, 1.0));
+    float lon = atan(-dir.z, dir.x);
+    float u = fract((lon + 3.14159265359) / 6.28318530718);
+    float v = clamp((lat + 1.57079632679) / 3.14159265359, 0.0005, 0.9995);
+    return vec2(u, v);
+  }
+
+  // Seamless 4-tier DEM sampler: Global -> Wide Polar (±365 km) -> Artemis 4K Zone (±155 km) -> Shackleton Core (±36 km)
+  float sampleUnifiedDem(vec3 dir) {
+    vec2 eqUv = unitNormalToEquirectUv(dir);
+    float dem = texture2D(uDemMap, eqUv).r;
+    if (dir.y > -0.974) return dem;
+
+    vec2 spMeters = (3474800.0 / max(0.5, 1.0 - dir.y)) * vec2(-dir.z, dir.x);
+    float spRad = length(spMeters);
+    if (spRad < 358000.0) {
+      float wWide = 1.0 - smoothstep(312000.0, 356000.0, spRad);
+      vec2 uvWide = vec2(0.5) + spMeters / 730000.0;
+      float demWide = sampleDem16Bilinear(uSpWideDem, uvWide, 1024.0);
+      dem = mix(dem, demWide, wWide);
+
+      float spBox = max(abs(spMeters.x), abs(spMeters.y));
+      if (spBox < 152000.0) {
+        float wArt = 1.0 - smoothstep(138000.0, 151500.0, spBox);
+        vec2 uvArt = vec2(0.5) + spMeters / 310000.0;
+        float demArt = sampleDem16Bilinear(uSpArtemisDem, uvArt, 2048.0);
+        dem = mix(dem, demArt, wArt);
+
+        if (spBox < 35200.0) {
+          float wIn = 1.0 - smoothstep(31500.0, 35000.0, spBox);
+          vec2 uvIn = vec2(0.5) + spMeters / 72000.0;
+          float demIn = sampleDem16Bilinear(uSpInnerDem, uvIn, 2048.0);
+          dem = mix(dem, demIn, wIn);
+        }
+      }
+    }
+    return dem;
+  }
+`;
+
 const VERTEX_SHADER = /* glsl */ `
   uniform sampler2D uDemMap;
   uniform float uDisplacementScale;
+  ${POLAR_SAMPLER_GLSL}
 
   varying vec2 vUv;
   varying vec3 vNormalObj;
@@ -41,14 +189,15 @@ const VERTEX_SHADER = /* glsl */ `
 
   void main() {
     vUv = uv;
-    float dem = texture2D(uDemMap, uv).r;
+    vec3 dir = normalize(position);
+    float dem = sampleUnifiedDem(dir);
     vDemRaw = dem;
     vNormalObj = normalize(normal);
 
-    // Center datum around 0.458 (~0 km selenoid)
-    float radialOffset = (dem - 0.458) * uDisplacementScale;
-    vec3 displaced = position + normalize(position) * radialOffset;
-    vPosObj = normalize(position);
+    // Center datum around 0.4565 (~0 km selenoid)
+    float radialOffset = (dem - 0.4565) * uDisplacementScale;
+    vec3 displaced = position + dir * radialOffset;
+    vPosObj = dir;
 
     gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.0);
   }
@@ -57,6 +206,10 @@ const VERTEX_SHADER = /* glsl */ `
 const FRAGMENT_SHADER = /* glsl */ `
   uniform sampler2D uColorMap;
   uniform sampler2D uDemMap;
+  uniform sampler2D uSpWideColor;
+  uniform sampler2D uSpArtemisColor;
+  uniform sampler2D uSpInnerColor;
+  ${POLAR_SAMPLER_GLSL}
   uniform int uMode;
   uniform vec3 uSunDir;
   uniform vec3 uEarthDir;
@@ -66,12 +219,40 @@ const FRAGMENT_SHADER = /* glsl */ `
   uniform float uShowGrid;
   uniform float uShowTerminator;
   uniform float uNightBoost;
+  uniform float uPinScale;
   uniform float uTime;
 
   varying vec2 vUv;
   varying vec3 vNormalObj;
   varying vec3 vPosObj;
   varying float vDemRaw;
+
+  vec3 sampleUnifiedAlbedo(vec3 dir, vec2 baseUv) {
+    vec3 col = texture2D(uColorMap, baseUv).rgb;
+    if (dir.y > -0.974) return col;
+
+    vec2 spMeters = (3474800.0 / max(0.5, 1.0 - dir.y)) * vec2(-dir.z, dir.x);
+    float spRad = length(spMeters);
+    if (spRad < 358000.0) {
+      float wWide = 1.0 - smoothstep(312000.0, 356000.0, spRad);
+      vec2 uvWide = vec2(0.5) + spMeters / 730000.0;
+      col = mix(col, texture2D(uSpWideColor, uvWide).rgb, wWide);
+
+      float spBox = max(abs(spMeters.x), abs(spMeters.y));
+      if (spBox < 152000.0) {
+        float wArt = 1.0 - smoothstep(138000.0, 151500.0, spBox);
+        vec2 uvArt = vec2(0.5) + spMeters / 310000.0;
+        col = mix(col, texture2D(uSpArtemisColor, uvArt).rgb, wArt);
+
+        if (spBox < 35200.0) {
+          float wIn = 1.0 - smoothstep(31500.0, 35000.0, spBox);
+          vec2 uvIn = vec2(0.5) + spMeters / 72000.0;
+          col = mix(col, texture2D(uSpInnerColor, uvIn).rgb, wIn);
+        }
+      }
+    }
+    return col;
+  }
 
   // Hypsometric Elevation Ramp (-9.1 km to +10.8 km)
   vec3 rampElevation(float t) {
@@ -168,37 +349,49 @@ const FRAGMENT_SHADER = /* glsl */ `
     float lonRad = atan(-n.z, n.x);
     float absLatDeg = abs(latRad) * 57.29578;
 
-    // Sample LROC albedo & multi-scale LOLA DEM gradients
-    vec3 albedoTex = texture2D(uColorMap, vUv).rgb;
-    float demC = texture2D(uDemMap, vUv).r;
+    // Sample unified 4-tier LROC albedo & 16-bit LOLA DEM (Global + 3 South Polar Stereographic clipmaps)
+    vec3 albedoTex = sampleUnifiedAlbedo(n, vUv);
+    float demC = sampleUnifiedDem(n);
 
-    vec2 texel = vec2(1.0 / 1024.0, 1.0 / 512.0);
-    float latScale = max(0.12, cos(latRad));
-    vec2 stepUv = vec2(texel.x / latScale, texel.y);
+    // Singularity-free orthonormal tangent frame across all latitudes including exact 90°S pole
+    vec3 helperAxis = abs(n.z) < 0.85 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 t1 = normalize(cross(helperAxis, n));
+    vec3 t2 = cross(n, t1);
 
-    float demE = texture2D(uDemMap, vec2(fract(vUv.x + stepUv.x), vUv.y)).r;
-    float demW = texture2D(uDemMap, vec2(fract(vUv.x - stepUv.x), vUv.y)).r;
-    float demN = texture2D(uDemMap, vec2(vUv.x, clamp(vUv.y + stepUv.y, 0.001, 0.999))).r;
-    float demS = texture2D(uDemMap, vec2(vUv.x, clamp(vUv.y - stepUv.y, 0.001, 0.999))).r;
+    // Adaptive physical gradient baseline (meters) matching the active DEM tier resolution
+    float stepMeters = 6200.0;
+    if (n.y < -0.974) {
+      vec2 spM = (3474800.0 / max(0.5, 1.0 - n.y)) * vec2(-n.z, n.x);
+      float spR = length(spM);
+      float spB = max(abs(spM.x), abs(spM.y));
+      stepMeters = mix(6200.0, 900.0, 1.0 - smoothstep(312000.0, 356000.0, spR));
+      stepMeters = mix(stepMeters, 240.0, 1.0 - smoothstep(138000.0, 151500.0, spB));
+      stepMeters = mix(stepMeters, 65.0, 1.0 - smoothstep(31500.0, 35000.0, spB));
+    }
+    float stepRad = stepMeters / 1737400.0;
 
-    // Wider neighborhood average (~35 km) to detect local crater bowls vs sunlit ridges
-    vec2 wideUv = stepUv * 4.5;
+    float demP1 = sampleUnifiedDem(normalize(n + t1 * stepRad));
+    float demM1 = sampleUnifiedDem(normalize(n - t1 * stepRad));
+    float demP2 = sampleUnifiedDem(normalize(n + t2 * stepRad));
+    float demM2 = sampleUnifiedDem(normalize(n - t2 * stepRad));
+
+    // Regional ~15 km neighborhood average to detect PSR crater bowls vs sunlit polar massifs/ridges
+    float wideRad = 15000.0 / 1737400.0;
     float demAvg = 0.25 * (
-      texture2D(uDemMap, vec2(fract(vUv.x + wideUv.x), vUv.y)).r +
-      texture2D(uDemMap, vec2(fract(vUv.x - wideUv.x), vUv.y)).r +
-      texture2D(uDemMap, vec2(vUv.x, clamp(vUv.y + wideUv.y, 0.001, 0.999))).r +
-      texture2D(uDemMap, vec2(vUv.x, clamp(vUv.y - wideUv.y, 0.001, 0.999))).r
+      sampleUnifiedDem(normalize(n + t1 * wideRad)) +
+      sampleUnifiedDem(normalize(n - t1 * wideRad)) +
+      sampleUnifiedDem(normalize(n + t2 * wideRad)) +
+      sampleUnifiedDem(normalize(n - t2 * wideRad))
     );
     float localProminence = (demC - demAvg) * 14.0; // >0 = ridge/rim, <0 = crater bowl
 
-    // Tangent basis for bump normal
-    vec3 east = normalize(vec3(-sin(lonRad), 0.0, -cos(lonRad)));
-    vec3 north = normalize(cross(east, n));
-    float dHdE = (demE - demW) * 11.5;
-    float dHdN = (demN - demS) * 11.5;
-    vec3 bumpedNormal = normalize(n - east * dHdE - north * dHdN);
+    // True physical surface gradient dh/ds (meters / meter) -> bumped normal & slope angle
+    float dh1 = ((demP1 - demM1) * 19670.0) / (2.0 * stepMeters);
+    float dh2 = ((demP2 - demM2) * 19670.0) / (2.0 * stepMeters);
+    float bumpGain = n.y < -0.978 ? 1.55 : 2.35;
+    vec3 bumpedNormal = normalize(n - t1 * (dh1 * bumpGain) - t2 * (dh2 * bumpGain));
 
-    float gradMag = length(vec2(demE - demW, demN - demS)) * 26.0;
+    float slopeDegPhys = atan(length(vec2(dh1, dh2))) * 57.29578;
     float albedoDetail = dot(albedoTex, vec3(0.333));
     float regolithHillshade = clamp(0.55 + 0.45 * dot(bumpedNormal, normalize(uSunDir + n * 0.45)), 0.25, 1.15);
 
@@ -217,7 +410,7 @@ const FRAGMENT_SHADER = /* glsl */ `
 
     if (uMode == 0) {
       // LROC True Albedo + Solar Terminator + Night-boost option
-      float minLight = mix(0.025 + earthshine, 0.24, uNightBoost);
+      float minLight = mix(0.025 + earthshine, 0.26, uNightBoost);
       float lightLevel = max(minLight, lommel * 1.18);
       // Warm solar tint on dayside, cool earthshine slate on nightside
       vec3 litTint = mix(vec3(0.72, 0.80, 0.96), vec3(1.03, 0.99, 0.94), sunlit);
@@ -225,9 +418,14 @@ const FRAGMENT_SHADER = /* glsl */ `
     } else if (uMode == 1) {
       // Topographic Elevation (LOLA DEM)
       vec3 heat = rampElevation(clamp(demC, 0.0, 1.0));
-      // Subtle contour lines every ~1.5 km
+      // Major contours every ~1.5 km + fine polar contours every ~250 m inside 85°S
       float contour = abs(fract(demC * 13.0) - 0.5);
-      float contourLine = 1.0 - smoothstep(0.0, 0.055, contour);
+      float contourLine = 1.0 - smoothstep(0.0, max(0.03, fwidth(demC * 13.0) * 1.2), contour);
+      if (n.y < -0.995) {
+        float fineC = abs(fract(demC * 78.0) - 0.5);
+        float fineLine = (1.0 - smoothstep(0.0, max(0.04, fwidth(demC * 78.0) * 1.2), fineC)) * 0.45;
+        contourLine = max(contourLine, fineLine);
+      }
       baseColor = heat * (0.72 + 0.36 * albedoDetail) * regolithHillshade;
       baseColor = mix(baseColor, baseColor * 1.25, contourLine * 0.18);
       if (uShowTerminator > 0.5) {
@@ -243,21 +441,21 @@ const FRAGMENT_SHADER = /* glsl */ `
       vec3 heat = rampTemp(clamp(tempNorm, 0.0, 1.0));
       baseColor = heat * (0.82 + 0.24 * albedoDetail);
     } else if (uMode == 3) {
-      // Terrain Slope & Hazard
-      float albedoRough = abs(albedoDetail - 0.48) * 0.22;
-      float slopeNorm = clamp(gradMag * 0.88 + abs(localProminence) * 0.35 + albedoRough, 0.0, 1.0);
+      // Terrain Slope & Hazard (calibrated directly to true physical LOLA slope 0°..32°+)
+      float albedoRough = abs(albedoDetail - 0.55) * 0.12;
+      float slopeNorm = clamp(slopeDegPhys / 32.0 + albedoRough, 0.0, 1.0);
       vec3 heat = rampSlope(slopeNorm);
-      baseColor = heat * (0.80 + 0.26 * albedoDetail);
+      baseColor = heat * (0.82 + 0.24 * albedoDetail) * (0.78 + 0.22 * regolithHillshade);
       if (uShowTerminator > 0.5) {
         baseColor *= mix(0.48, 1.04, sunlit);
       }
     } else if (uMode == 4) {
       // Solar Illumination Duty Cycle (%)
       float polarFactor = smoothstep(76.0, 88.5, absLatDeg);
-      float polarDuty = clamp(0.50 + localProminence * 1.35 + (demC - 0.46) * 0.55, 0.0, 0.98);
+      float polarDuty = clamp(0.50 + localProminence * 1.35 + (demC - 0.4565) * 0.55, 0.0, 0.98);
       float dutyNorm = mix(0.50 + localProminence * 0.12, polarDuty, polarFactor);
       vec3 heat = rampIllum(clamp(dutyNorm, 0.0, 1.0));
-      baseColor = heat * (0.84 + 0.22 * albedoDetail);
+      baseColor = heat * (0.84 + 0.22 * albedoDetail) * (0.82 + 0.18 * regolithHillshade);
     } else if (uMode == 5) {
       // Water-Ice Equivalent (wt% H2O)
       float polarMask = smoothstep(77.5, 87.5, absLatDeg);
@@ -271,13 +469,13 @@ const FRAGMENT_SHADER = /* glsl */ `
     } else if (uMode == 6) {
       // Direct-to-Earth (DTE) Comm Visibility
       vec3 heat = rampDte(earthDot, localProminence);
-      baseColor = heat * (0.76 + 0.32 * albedoDetail);
+      baseColor = heat * (0.76 + 0.32 * albedoDetail) * (0.82 + 0.18 * regolithHillshade);
       if (uShowTerminator > 0.5) {
         baseColor *= mix(0.52, 1.05, sunlit);
       }
     }
 
-    // Optional Selenographic Graticule Grid (every 15° lat/lon + Polar Artemis Circles)
+    // Optional Selenographic Graticule Grid (every 15° lat/lon + Polar Artemis Circles 80°S, 85°S, 88°S, 89°S)
     if (uShowGrid > 0.5) {
       float latDeg = latRad * 57.29578;
       float lonDeg = lonRad * 57.29578;
@@ -288,13 +486,19 @@ const FRAGMENT_SHADER = /* glsl */ `
       float dLon = fwidth(lonDeg / 15.0) * 1.15;
 
       float gridLat = 1.0 - smoothstep(0.0, max(0.004, dLat), latStep);
-      // Suppress dense longitude lines right inside 88.5° pole cap
-      float gridLon = (absLatDeg < 88.0) ? (1.0 - smoothstep(0.0, max(0.004, dLon), lonStep)) : 0.0;
+      if (latDeg < -78.0) {
+        float polarRingStep = abs(fract((latDeg + 90.0) / 2.0 + 0.5) - 0.5);
+        float dPolar = fwidth(latDeg / 2.0) * 1.15;
+        float polarLatGrid = (1.0 - smoothstep(0.0, max(0.004, dPolar), polarRingStep)) * 0.55;
+        gridLat = max(gridLat, polarLatGrid);
+      }
+      // Suppress dense longitude lines right inside 89.2° pole cap
+      float gridLon = (absLatDeg < 89.2) ? (1.0 - smoothstep(0.0, max(0.004, dLon), lonStep)) : 0.0;
       float grid = max(gridLat, gridLon);
 
       // Highlight Equator (0°), Prime Meridian (0°), and 85°S Artemis Polar Ring
-      float isPrimeOrEq = (abs(latDeg) < 0.45 || abs(lonDeg) < 0.45) ? 1.0 : 0.0;
-      float isArtemisRing = (abs(latDeg + 85.0) < 0.32) ? 1.0 : 0.0;
+      float isPrimeOrEq = (abs(latDeg) < 0.35 || (abs(lonDeg) < 0.35 && absLatDeg < 89.2)) ? 1.0 : 0.0;
+      float isArtemisRing = (abs(latDeg + 85.0) < max(0.08, fwidth(latDeg) * 1.4)) ? 1.0 : 0.0;
 
       vec3 gridCol = isArtemisRing > 0.5
         ? vec3(0.96, 0.62, 0.05)
@@ -303,21 +507,21 @@ const FRAGMENT_SHADER = /* glsl */ `
       baseColor = mix(baseColor, gridCol, clamp(grid + isArtemisRing * 0.7, 0.0, 1.0) * gridAlpha);
     }
 
-    // Animated Radar Ring around Selected Primary Landing Site
+    // Animated Radar Ring around Selected Primary Landing Site (scales cleanly with zoom altitude!)
     float siteAng = acos(clamp(dot(n, normalize(uSiteDir)), -1.0, 1.0));
-    float ringPulse = mod(uTime * 0.022, 0.045);
-    float outerPulse = (1.0 - smoothstep(0.0, 0.0045, abs(siteAng - ringPulse))) * (1.0 - ringPulse / 0.045);
-    float fixedRing = 1.0 - smoothstep(0.0, 0.0032, abs(siteAng - 0.014));
+    float maxPulse = 0.052 * uPinScale;
+    float ringPulse = mod(uTime * 0.022 * uPinScale, maxPulse);
+    float outerPulse = (1.0 - smoothstep(0.0, 0.0045 * uPinScale, abs(siteAng - ringPulse))) * (1.0 - ringPulse / maxPulse);
+    float fixedRing = 1.0 - smoothstep(0.0, 0.0032 * uPinScale, abs(siteAng - 0.019 * uPinScale));
     baseColor = mix(baseColor, vec3(0.98, 0.73, 0.14), clamp(fixedRing * 0.85 + outerPulse * 0.65, 0.0, 1.0));
 
     // Secondary Compare Site Ring (Cyan)
     if (uHasCompare > 0.5) {
       float cmpAng = acos(clamp(dot(n, normalize(uCompareSiteDir)), -1.0, 1.0));
-      float cmpRing = 1.0 - smoothstep(0.0, 0.0032, abs(cmpAng - 0.014));
+      float cmpRing = 1.0 - smoothstep(0.0, 0.0032 * uPinScale, abs(cmpAng - 0.019 * uPinScale));
       baseColor = mix(baseColor, vec3(0.22, 0.74, 0.97), cmpRing * 0.85);
     }
 
-    // Subtle atmospheric-free Fresnel rim sheen for crisp 3D silhouette against deep space
     gl_FragColor = vec4(baseColor, 1.0);
   }
 `;
@@ -325,6 +529,11 @@ const FRAGMENT_SHADER = /* glsl */ `
 export type CameraPreset =
   | 'free'
   | 'south-pole'
+  | 'sp-overview'
+  | 'sp-shackleton'
+  | 'sp-malapert'
+  | 'sp-degerlache'
+  | 'sp-mouton'
   | 'north-pole'
   | 'nearside'
   | 'farside'
@@ -332,7 +541,23 @@ export type CameraPreset =
   | 'rover-locality'
   | 'rover-route';
 
+const SOUTH_POLE_LANDMARKS: Array<{
+  name: string;
+  subtitle: string;
+  lat: number;
+  lon: number;
+  kind: 'psr' | 'massif';
+}> = [
+  { name: 'Shackleton PSR', subtitle: '-4.2 km Cold Trap', lat: -89.54, lon: 129.8, kind: 'psr' },
+  { name: 'Shoemaker PSR', subtitle: '-4.2 km H₂O Trap', lat: -88.1, lon: 45.0, kind: 'psr' },
+  { name: 'Faustini PSR', subtitle: '-3.9 km Cold Trap', lat: -87.3, lon: 84.3, kind: 'psr' },
+  { name: 'Haworth PSR', subtitle: '-4.0 km Cold Trap', lat: -87.45, lon: -4.8, kind: 'psr' },
+  { name: 'de Gerlache PSR', subtitle: '-3.5 km Cold Trap', lat: -88.5, lon: -68.0, kind: 'psr' },
+  { name: 'Cabeus (LCROSS)', subtitle: 'H₂O Plume Site', lat: -84.9, lon: -35.5, kind: 'psr' },
+];
+
 interface LunarGlobe3DProps {
+  isSouthPoleFocus?: boolean;
   heatmapMode: HeatmapMode;
   evaluation: SiteEvaluation;
   compareSite: LandingSite | null;
@@ -363,11 +588,15 @@ interface LunarGlobe3DProps {
   onSelectCandidatePath?: (path: CandidateCorridorPath) => void;
   onSelectSatellite: (satId: string) => void;
   onHoverCoords: (coords: { lat: number; lon: number; elevKm: number } | null) => void;
+  onWarpToTime?: (targetTimeMs: number, label: string) => void;
+  onSnapToTime?: (targetTimeMs: number) => void;
+  previewSunEarthPoint?: { lat: number; lon: number; label: string } | null;
 }
 
 interface SceneContentProps extends LunarGlobe3DProps {}
 
 const MoonSceneContent: React.FC<SceneContentProps> = ({
+  isSouthPoleFocus = false,
   heatmapMode,
   evaluation,
   compareSite,
@@ -398,11 +627,31 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
   onSelectCandidatePath,
   onSelectSatellite,
   onHoverCoords,
+  onWarpToTime,
+  onSnapToTime,
+  previewSunEarthPoint = null,
 }) => {
-  const [colorMap, demMap] = useLoader(THREE.TextureLoader, [
+  const [
+    colorMap,
+    demMap,
+    spWideColor,
+    spArtemisColor,
+    spInnerColor,
+    spWideDem,
+    spArtemisDem,
+    spInnerDem,
+  ] = useLoader(THREE.TextureLoader, [
     '/textures/lroc_color.jpg',
     '/textures/lola_dem.jpg',
+    '/textures/lroc_sp_wide.jpg',
+    '/textures/lroc_sp_artemis_4k.jpg',
+    '/textures/lroc_sp_inner.jpg',
+    '/textures/lola_sp_wide_16bit.png',
+    '/textures/lola_sp_artemis_16bit.png',
+    '/textures/lola_sp_inner_16bit.png',
   ]);
+
+  const polarSphereGeom = useMemo(() => createPolarRefinedSphereGeometry(), []);
 
   useEffect(() => {
     colorMap.wrapS = THREE.RepeatWrapping;
@@ -410,10 +659,39 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
     colorMap.anisotropy = 8;
     demMap.wrapS = THREE.RepeatWrapping;
     demMap.wrapT = THREE.ClampToEdgeWrapping;
-  }, [colorMap, demMap]);
+
+    for (const tex of [spWideColor, spArtemisColor, spInnerColor]) {
+      tex.wrapS = THREE.ClampToEdgeWrapping;
+      tex.wrapT = THREE.ClampToEdgeWrapping;
+      tex.anisotropy = 8;
+      tex.needsUpdate = true;
+    }
+
+    // 16-bit (R=hi, G=lo) DEM clipmaps MUST use NearestFilter + NoColorSpace so
+    // hardware sRGB gamma or byte-wrapping interpolation never corrupts 0.3m relief
+    for (const demTex of [spWideDem, spArtemisDem, spInnerDem]) {
+      demTex.wrapS = THREE.ClampToEdgeWrapping;
+      demTex.wrapT = THREE.ClampToEdgeWrapping;
+      demTex.minFilter = THREE.NearestFilter;
+      demTex.magFilter = THREE.NearestFilter;
+      demTex.generateMipmaps = false;
+      demTex.colorSpace = THREE.NoColorSpace;
+      demTex.needsUpdate = true;
+    }
+  }, [
+    colorMap,
+    demMap,
+    spWideColor,
+    spArtemisColor,
+    spInnerColor,
+    spWideDem,
+    spArtemisDem,
+    spInnerDem,
+  ]);
 
   const shaderRef = useRef<THREE.ShaderMaterial>(null);
   const controlsRef = useRef<any>(null);
+  const beaconRefs = useRef<Map<string, THREE.Mesh>>(new Map());
   const pointerDownPos = useRef<{ x: number; y: number } | null>(null);
   const userGrabbedDuringAnim = useRef<boolean>(false);
   const { camera } = useThree();
@@ -422,6 +700,19 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
   const flyTargetCamPos = useRef<THREE.Vector3 | null>(null);
 
   const dispScale = terrainExaggeration * 0.022;
+
+  // Eliminate OrbitControls gimbal lock over 90°S in South Pole mode by orienting
+  // 0° Prime Meridian (+X, toward Earth / Malapert) to 12 o'clock UP
+  useEffect(() => {
+    if (isSouthPoleFocus) {
+      camera.up.set(1, 0, 0);
+    } else {
+      camera.up.set(0, 1, 0);
+    }
+    if (controlsRef.current) {
+      controlsRef.current.update();
+    }
+  }, [isSouthPoleFocus, camera]);
 
   useEffect(() => {
     if (isRoverAnimating && roverChaseCam) {
@@ -440,6 +731,26 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
       targetLat = -88.5;
       targetLon = 0;
       dist = 2.25;
+    } else if (cameraPreset === 'sp-overview') {
+      targetLat = -89.96;
+      targetLon = 180;
+      dist = 1.46;
+    } else if (cameraPreset === 'sp-shackleton') {
+      targetLat = -89.54;
+      targetLon = 129.8;
+      dist = 1.052;
+    } else if (cameraPreset === 'sp-malapert') {
+      targetLat = -86.4;
+      targetLon = -2.0;
+      dist = 1.145;
+    } else if (cameraPreset === 'sp-degerlache') {
+      targetLat = -88.25;
+      targetLon = -25.0;
+      dist = 1.135;
+    } else if (cameraPreset === 'sp-mouton') {
+      targetLat = -85.0;
+      targetLon = 38.0;
+      dist = 1.155;
     } else if (cameraPreset === 'north-pole') {
       targetLat = 88.5;
       targetLon = 0;
@@ -455,25 +766,33 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
     } else if (cameraPreset === 'site') {
       targetLat = evaluation.site.lat;
       targetLon = evaluation.site.lon;
-      dist = Math.abs(targetLat) > 78 ? 2.15 : 2.45;
+      dist = isSouthPoleFocus
+        ? Math.abs(targetLat) > 87.5
+          ? 1.085
+          : 1.18
+        : Math.abs(targetLat) > 78
+        ? 2.15
+        : 2.45;
     } else if (cameraPreset === 'rover-locality') {
       const orig = roverStartCoords || roverRangeEnvelope?.origin || evaluation.site;
       targetLat = orig.lat;
       targetLon = orig.lon;
       const radiusKm = roverRangeEnvelope?.maxReachableRadiusKm ?? 16;
       // Zoom right into the local operational neighborhood around Start [A]
-      dist = Math.max(1.068, Math.min(1.85, 1.052 + (radiusKm / 1737.4) * 3.8));
+      dist = Math.max(1.042, Math.min(1.85, 1.036 + (radiusKm / 1737.4) * 3.8));
     } else if (cameraPreset === 'rover-route' && roverPlan && roverPlan.waypoints.length > 0) {
       const mid = roverPlan.waypoints[Math.floor(roverPlan.waypoints.length / 2)];
       targetLat = mid.lat;
       targetLon = mid.lon;
-      dist = Math.max(1.075, Math.min(2.25, 1.058 + (roverPlan.geodesicDistanceKm / 1737.4) * 3.1));
+      dist = Math.max(1.048, Math.min(2.25, 1.042 + (roverPlan.geodesicDistanceKm / 1737.4) * 3.1));
     }
 
-    const clampedLat = Math.max(-89.7, Math.min(89.7, targetLat));
+    const minLatClamp = isSouthPoleFocus ? -89.98 : -89.7;
+    const clampedLat = Math.max(minLatClamp, Math.min(89.7, targetLat));
     const [cx, cy, cz] = latLonToCartesian(clampedLat, targetLon, dist);
     flyTargetCamPos.current = new THREE.Vector3(cx, cy, cz);
   }, [
+    isSouthPoleFocus,
     cameraPreset,
     cameraPresetNonce,
     evaluation.site.id,
@@ -488,6 +807,12 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
     () => ({
       uColorMap: { value: colorMap },
       uDemMap: { value: demMap },
+      uSpWideColor: { value: spWideColor },
+      uSpArtemisColor: { value: spArtemisColor },
+      uSpInnerColor: { value: spInnerColor },
+      uSpWideDem: { value: spWideDem },
+      uSpArtemisDem: { value: spArtemisDem },
+      uSpInnerDem: { value: spInnerDem },
       uDisplacementScale: { value: dispScale },
       uMode: { value: HEATMAP_INDEX[heatmapMode] },
       uSunDir: { value: new THREE.Vector3(1, 0, 0) },
@@ -499,8 +824,18 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
       uShowTerminator: { value: 1 },
       uNightBoost: { value: 0 },
       uTime: { value: 0 },
+      uPinScale: { value: 1.0 },
     }),
-    [colorMap, demMap]
+    [
+      colorMap,
+      demMap,
+      spWideColor,
+      spArtemisColor,
+      spInnerColor,
+      spWideDem,
+      spArtemisDem,
+      spInnerDem,
+    ]
   );
 
   // Sync shader uniforms every render/prop update
@@ -521,7 +856,7 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
   );
 
   const siteRadialOffset =
-    1.0 + ((evaluation.elevationKm + 9.12) / 19.88 - 0.458) * dispScale + 0.006;
+    1.0 + ((evaluation.elevationKm + 8.98) / 19.67 - 0.4565) * dispScale + (isSouthPoleFocus ? 0.003 : 0.006);
 
   const sitePos3D = useMemo(
     () =>
@@ -536,11 +871,21 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
   const comparePos3D = useMemo(() => {
     if (!compareSite) return null;
     const elev = compareSite.elevationKm ?? sampleElevationKm(compareSite.lat, compareSite.lon);
-    const r = 1.0 + ((elev + 9.12) / 19.88 - 0.458) * dispScale + 0.006;
+    const r = 1.0 + ((elev + 8.98) / 19.67 - 0.4565) * dispScale + (isSouthPoleFocus ? 0.003 : 0.006);
     return latLonToCartesian(compareSite.lat, compareSite.lon, r);
-  }, [compareSite, dispScale]);
+  }, [compareSite, dispScale, isSouthPoleFocus]);
 
   useFrame((state, delta) => {
+    const camDist = camera.position.length();
+
+    // Continuous altitude-adaptive beacon scale:
+    // At full globe overview (camDist >= 2.4), pointScale = 1.0 (easy to spot and click from space).
+    // At close zoom (camDist <= 1.25, e.g. South Pole exploration view), pointScale scales down to ~0.20 (20% of original size).
+    const pointScale = Math.max(0.18, Math.min(1.0, (camDist - 1.0) / 1.35));
+    beaconRefs.current.forEach((mesh) => {
+      mesh.scale.set(pointScale, pointScale, pointScale);
+    });
+
     if (shaderRef.current) {
       const u = shaderRef.current.uniforms;
       u.uDisplacementScale.value = dispScale;
@@ -558,14 +903,18 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
       u.uShowTerminator.value = showTerminator ? 1.0 : 0.0;
       u.uNightBoost.value = nightBoost ? 1.0 : 0.0;
       u.uTime.value = state.clock.elapsedTime;
+      u.uPinScale.value = pointScale;
     }
 
-    // Adaptive fine-grained rotation speed when zoomed closely into a locality
+    // Adaptive fine-grained rotation & zoom speed when zoomed closely into polar craters
     if (controlsRef.current) {
-      const camDist = camera.position.length();
       controlsRef.current.rotateSpeed = Math.max(
-        0.055,
+        0.04,
         Math.min(0.65, (camDist - 1.0) * 0.62)
+      );
+      controlsRef.current.zoomSpeed = Math.max(
+        0.32,
+        Math.min(0.88, (camDist - 0.995) * 0.95)
       );
     }
 
@@ -584,10 +933,10 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
       const frac = exact - i0;
       const lat = wps[i0].lat + (wps[i1].lat - wps[i0].lat) * frac;
       const lon = wps[i0].lon + (wps[i1].lon - wps[i0].lon) * frac;
-      const clampedLat = Math.max(-89.7, Math.min(89.7, lat));
+      const clampedLat = Math.max(isSouthPoleFocus ? -89.98 : -89.7, Math.min(89.7, lat));
       const chaseDist = Math.max(
-        1.062,
-        Math.min(1.36, 1.052 + (roverPlan.geodesicDistanceKm / 1737.4) * 1.85)
+        1.038,
+        Math.min(1.36, 1.032 + (roverPlan.geodesicDistanceKm / 1737.4) * 1.85)
       );
       const [cx, cy, cz] = latLonToCartesian(clampedLat, lon, chaseDist);
       const targetVec = new THREE.Vector3(cx, cy, cz);
@@ -613,16 +962,38 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
   // Precompute orbit curves (re-evaluated every ~15 min of sim time or scale toggle)
   const orbitBucket = Math.floor(evaluation.timestampMs / (15 * 60 * 1000));
   const orbitCurves = useMemo(() => {
-    return evaluation.activeSatellites.map((st) => ({
-      sat: st.satellite,
-      points: sampleSatelliteOrbitCurve(
+    return evaluation.activeSatellites.map((st) => {
+      const points = sampleSatelliteOrbitCurve(
         st.satellite,
         evaluation.timestampMs,
         128,
         trueOrbitScale
-      ),
-    }));
+      );
+      const curveVecs = points
+        .slice(0, -1)
+        .map(([x, y, z]) => new THREE.Vector3(x, y, z));
+      const hitCurve = new THREE.CatmullRomCurve3(curveVecs, true);
+      return {
+        sat: st.satellite,
+        points,
+        hitCurve,
+      };
+    });
   }, [orbitBucket, trueOrbitScale]);
+
+  const satOrbitDownRef = useRef<{ x: number; y: number } | null>(null);
+  const [satWarpNode, setSatWarpNode] = useState<{
+    satId: string;
+    satName: string;
+    pos: [number, number, number];
+    targetTimeMs: number;
+  } | null>(null);
+
+  useEffect(() => {
+    if (satWarpNode && evaluation.timestampMs >= satWarpNode.targetTimeMs - 15_000) {
+      setSatWarpNode(null);
+    }
+  }, [evaluation.timestampMs, satWarpNode]);
 
   const handlePointerDown = (e: ThreeEvent<PointerEvent>) => {
     pointerDownPos.current = { x: e.clientX, y: e.clientY };
@@ -719,14 +1090,14 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
         </Html>
       </group>
 
-      {/* Primary High-Resolution 3D Moon Mesh */}
+      {/* Primary High-Resolution 3D Moon Mesh (Polar-Refined 120-Ring Cap + Global Sphere) */}
       <mesh
+        geometry={polarSphereGeom}
         onPointerDown={handlePointerDown}
         onPointerUp={handlePointerUp}
         onPointerMove={handlePointerMove}
         onPointerOut={() => onHoverCoords(null)}
       >
-        <sphereGeometry args={[1, 256, 128]} />
         <shaderMaterial
           ref={shaderRef}
           vertexShader={VERTEX_SHADER}
@@ -748,11 +1119,18 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
 
       {/* Curated Landing Site Beacons */}
       {curatedSites.map((s) => {
+        if (isSouthPoleFocus && s.lat > -70 && s.id !== evaluation.site.id) {
+          return null;
+        }
         const isSelected = s.id === evaluation.site.id;
         const isCompare = compareSite?.id === s.id;
         const elev = s.elevationKm ?? sampleElevationKm(s.lat, s.lon);
-        const r = 1.0 + ((elev + 9.12) / 19.88 - 0.458) * dispScale + 0.008;
+        const r =
+          1.0 +
+          ((elev + 8.98) / 19.67 - 0.4565) * dispScale +
+          (isSouthPoleFocus ? 0.0036 : 0.008);
         const pos = latLonToCartesian(s.lat, s.lon, r);
+        const beaconRadius = isSelected ? 0.014 : 0.0085;
         const handleSiteClick = (ev: any) => {
           ev.stopPropagation();
           if (roverPickMode !== 'none' && onRoverPickPoint) {
@@ -764,8 +1142,21 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
 
         return (
           <group key={s.id} position={pos}>
+            {/* Generous invisible raycast hit target for effortless clicking */}
             <mesh onClick={handleSiteClick}>
-              <sphereGeometry args={[isSelected ? 0.015 : 0.009, 16, 16]} />
+              <sphereGeometry args={[0.009, 8, 8]} />
+              <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+            </mesh>
+
+            {/* Visual Beacon Sphere (Smoothly scales down to ~20% when zoomed in) */}
+            <mesh
+              ref={(el) => {
+                if (el) beaconRefs.current.set(s.id, el);
+                else beaconRefs.current.delete(s.id);
+              }}
+              onClick={handleSiteClick}
+            >
+              <sphereGeometry args={[beaconRadius, 16, 16]} />
               <meshBasicMaterial
                 color={
                   isSelected
@@ -782,7 +1173,7 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
             </mesh>
             {(showSiteLabels || isSelected || isCompare) && (
               <Html
-                position={[0, 0.024, 0]}
+                position={[0, 0, 0]}
                 center
                 occlude={false}
                 zIndexRange={[10, 0]}
@@ -790,7 +1181,7 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
                 <button
                   type="button"
                   onClick={handleSiteClick}
-                  className={`hud-btn px-1.5 py-0.5 rounded text-[10px] font-mono-tech whitespace-nowrap border backdrop-blur-md cursor-pointer ${
+                  className={`-translate-y-3.5 hud-btn px-1.5 py-0.5 rounded text-[10px] font-mono-tech whitespace-nowrap border backdrop-blur-md cursor-pointer ${
                     isSelected
                       ? 'bg-[#f59e0b]/90 text-[#05070b] font-semibold border-[#fde68a] shadow-lg'
                       : isCompare
@@ -807,15 +1198,69 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
         );
       })}
 
+      {/* South Pole Cold-Trap / PSR Reference Callouts (Dedicated South Pole View) */}
+      {isSouthPoleFocus &&
+        showSiteLabels &&
+        SOUTH_POLE_LANDMARKS.map((lm) => {
+          const elev = sampleElevationKm(lm.lat, lm.lon);
+          const r = 1.0 + ((elev + 8.98) / 19.67 - 0.4565) * dispScale + 0.0028;
+          const pos = latLonToCartesian(lm.lat, lm.lon, r);
+          const handleLmClick = (ev: any) => {
+            ev.stopPropagation();
+            if (roverPickMode !== 'none' && onRoverPickPoint) {
+              onRoverPickPoint(lm.lat, lm.lon, lm.name);
+            } else {
+              onSelectCustomPoint(lm.lat, lm.lon);
+            }
+          };
+
+          return (
+            <group key={lm.name} position={pos}>
+              <mesh onClick={handleLmClick}>
+                <sphereGeometry args={[0.006, 8, 8]} />
+                <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+              </mesh>
+              <mesh
+                ref={(el) => {
+                  if (el) beaconRefs.current.set(`lm-${lm.name}`, el);
+                  else beaconRefs.current.delete(`lm-${lm.name}`);
+                }}
+                onClick={handleLmClick}
+              >
+                <sphereGeometry args={[0.005, 12, 12]} />
+                <meshBasicMaterial color="#22d3ee" />
+              </mesh>
+              <Html position={[0, 0, 0]} center zIndexRange={[6, 0]}>
+                <div
+                  onClick={handleLmClick}
+                  className="-translate-y-3 px-1.5 py-0.5 rounded bg-[#04111d]/80 text-cyan-200/90 font-mono-tech text-[9px] border border-cyan-400/35 hover:border-cyan-300 whitespace-nowrap cursor-pointer backdrop-blur-sm"
+                  title={`${lm.name} • ${lm.subtitle} (${Math.abs(lm.lat).toFixed(2)}°S, ${lm.lon}°)`}
+                >
+                  ❄ {lm.name}
+                </div>
+              </Html>
+            </group>
+          );
+        })}
+
       {/* Custom Clicked Site Beacon (when user clicked an arbitrary coordinate) */}
       {evaluation.site.category === 'custom' && (
         <group position={sitePos3D}>
-          <mesh>
-            <sphereGeometry args={[0.018, 16, 16]} />
+          <mesh onClick={() => onSelectSite(evaluation.site)}>
+            <sphereGeometry args={[0.012, 8, 8]} />
+            <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+          </mesh>
+          <mesh
+            ref={(el) => {
+              if (el) beaconRefs.current.set('custom', el);
+              else beaconRefs.current.delete('custom');
+            }}
+          >
+            <sphereGeometry args={[0.015, 16, 16]} />
             <meshBasicMaterial color="#fbbf24" />
           </mesh>
-          <Html position={[0, 0.032, 0]} center zIndexRange={[12, 0]}>
-            <div className="px-2 py-0.5 rounded bg-[#f59e0b] text-[#05070b] font-mono-tech font-semibold text-[10px] border border-[#fef08a] whitespace-nowrap shadow-lg">
+          <Html position={[0, 0, 0]} center zIndexRange={[12, 0]}>
+            <div className="-translate-y-3.5 px-2 py-0.5 rounded bg-[#f59e0b] text-[#05070b] font-mono-tech font-semibold text-[10px] border border-[#fef08a] whitespace-nowrap shadow-lg">
               ◈ {evaluation.site.name}
             </div>
           </Html>
@@ -869,21 +1314,189 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
         </>
       )}
 
+      {/* Live Sun–Earth Relative Surface Preview Reticle + Sub-Solar / Sub-Earth Anchors */}
+      {previewSunEarthPoint && (() => {
+        const prevElev = sampleElevationKm(previewSunEarthPoint.lat, previewSunEarthPoint.lon);
+        const prevR = 1.0 + ((prevElev + 9.12) / 19.88 - 0.458) * dispScale + 0.012;
+        const prevPos = latLonToCartesian(
+          previewSunEarthPoint.lat,
+          previewSunEarthPoint.lon,
+          prevR
+        );
+        const subSolPos = latLonToCartesian(
+          evaluation.sun.subLat,
+          evaluation.sun.subLon,
+          1.015
+        );
+        const subEarthPos = latLonToCartesian(
+          evaluation.earth.subLat,
+          evaluation.earth.subLon,
+          1.015
+        );
+        return (
+          <>
+            <group position={subSolPos}>
+              <mesh>
+                <sphereGeometry args={[0.016, 16, 16]} />
+                <meshBasicMaterial color="#fde047" />
+              </mesh>
+              <Html position={[0, 0.028, 0]} center zIndexRange={[18, 0]}>
+                <div className="pointer-events-none px-1.5 py-0.2 rounded bg-amber-950/90 border border-yellow-400/60 text-yellow-200 font-mono-tech text-[9px] whitespace-nowrap">
+                  ☉ Sub-Solar ({evaluation.sun.subLat.toFixed(1)}°, {evaluation.sun.subLon.toFixed(1)}°)
+                </div>
+              </Html>
+            </group>
+
+            <group position={subEarthPos}>
+              <mesh>
+                <sphereGeometry args={[0.016, 16, 16]} />
+                <meshBasicMaterial color="#38bdf8" />
+              </mesh>
+              <Html position={[0, 0.028, 0]} center zIndexRange={[18, 0]}>
+                <div className="pointer-events-none px-1.5 py-0.2 rounded bg-sky-950/90 border border-sky-400/60 text-sky-200 font-mono-tech text-[9px] whitespace-nowrap">
+                  ⊕ Sub-Earth ({evaluation.earth.subLat.toFixed(1)}°, {evaluation.earth.subLon.toFixed(1)}°)
+                </div>
+              </Html>
+            </group>
+
+            <group position={prevPos}>
+              <mesh>
+                <octahedronGeometry args={[0.022, 0]} />
+                <meshBasicMaterial color="#22d3ee" />
+              </mesh>
+              <Html position={[0, 0.036, 0]} center zIndexRange={[22, 0]}>
+                <div className="pointer-events-none px-2 py-0.5 rounded bg-cyan-950/95 border border-cyan-300/80 text-cyan-100 font-mono-tech font-bold text-[9.5px] whitespace-nowrap shadow-xl">
+                  ⌖ {previewSunEarthPoint.label} ({previewSunEarthPoint.lat.toFixed(2)}°, {previewSunEarthPoint.lon.toFixed(2)}°)
+                </div>
+              </Html>
+            </group>
+          </>
+        );
+      })()}
+
       {/* Active Cislunar Constellation Orbits, Spacecraft & Crosslink Cones */}
       {showOrbits &&
-        orbitCurves.map(({ sat, points }) => {
+        orbitCurves.map(({ sat, points, hitCurve }) => {
           const isFocus = selectedSatelliteId === sat.id;
           return (
-            <Line
-              key={`orbit-${sat.id}`}
-              points={points}
-              color={sat.color}
-              lineWidth={isFocus ? 2.4 : 1.1}
-              transparent
-              opacity={isFocus ? 0.92 : selectedSatelliteId ? 0.24 : 0.48}
-            />
+            <group key={`orbit-grp-${sat.id}`}>
+              <Line
+                points={points}
+                color={sat.color}
+                lineWidth={isFocus ? 2.4 : 1.1}
+                transparent
+                opacity={isFocus ? 0.92 : selectedSatelliteId ? 0.24 : 0.48}
+              />
+              {onWarpToTime && (
+                <mesh
+                  onPointerDown={(e: ThreeEvent<PointerEvent>) => {
+                    satOrbitDownRef.current = { x: e.clientX, y: e.clientY };
+                  }}
+                  onPointerUp={(e: ThreeEvent<PointerEvent>) => {
+                    if (!satOrbitDownRef.current) return;
+                    const dist = Math.hypot(
+                      e.clientX - satOrbitDownRef.current.x,
+                      e.clientY - satOrbitDownRef.current.y
+                    );
+                    satOrbitDownRef.current = null;
+                    if (dist < 6) {
+                      e.stopPropagation();
+                      let bestIdx = 0;
+                      let bestD2 = Infinity;
+                      for (let i = 0; i < points.length; i++) {
+                        const dx = points[i][0] - e.point.x;
+                        const dy = points[i][1] - e.point.y;
+                        const dz = points[i][2] - e.point.z;
+                        const d2 = dx * dx + dy * dy + dz * dz;
+                        if (d2 < bestD2) {
+                          bestD2 = d2;
+                          bestIdx = i;
+                        }
+                      }
+                      const frac = bestIdx / Math.max(1, points.length - 1);
+                      const targetMs = solveNextSatelliteOrbitPointTime(
+                        sat,
+                        evaluation.timestampMs,
+                        frac
+                      );
+                      onSelectSatellite(sat.id);
+                      setSatWarpNode({
+                        satId: sat.id,
+                        satName: sat.name.split(' (')[0],
+                        pos: points[bestIdx],
+                        targetTimeMs: targetMs,
+                      });
+                    }
+                  }}
+                >
+                  <tubeGeometry args={[hitCurve, 96, 0.024, 6, true]} />
+                  <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+                </mesh>
+              )}
+            </group>
           );
         })}
+
+      {/* KSP Clicked Satellite Orbit "Warp Here" Node */}
+      {showOrbits && satWarpNode && onWarpToTime && (() => {
+        const remMs = Math.max(0, satWarpNode.targetTimeMs - evaluation.timestampMs);
+        return (
+          <group position={satWarpNode.pos}>
+            <mesh>
+              <octahedronGeometry args={[0.022, 0]} />
+              <meshBasicMaterial color="#22c55e" />
+            </mesh>
+            <Html position={[0, 0.045, 0]} center zIndexRange={[30, 0]}>
+              <div className="pointer-events-auto rounded-lg bg-[#04130d]/95 border border-emerald-400/80 px-2.5 py-1.5 font-mono-tech shadow-2xl space-y-1 min-w-[175px]">
+                <div className="flex items-center justify-between gap-2 text-[9.5px] text-emerald-300 font-bold">
+                  <span>🛰 {satWarpNode.satName} Node</span>
+                  <button
+                    type="button"
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      setSatWarpNode(null);
+                    }}
+                    className="text-slate-400 hover:text-white cursor-pointer px-1"
+                  >
+                    ✕
+                  </button>
+                </div>
+                <div className="text-[9px] text-slate-300">
+                  ETA: <strong className="text-white">T − {formatWarpDelta(remMs)}</strong>
+                </div>
+                <div className="flex items-center gap-1 pt-0.5">
+                  <button
+                    type="button"
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      onWarpToTime(
+                        satWarpNode.targetTimeMs,
+                        `${satWarpNode.satName} Orbit Node`
+                      );
+                    }}
+                    className="flex-1 px-2 py-0.5 rounded bg-emerald-500 hover:bg-emerald-400 text-[#04130d] font-bold text-[9.5px] cursor-pointer"
+                  >
+                    ▸▸▸ Warp Here
+                  </button>
+                  {onSnapToTime && (
+                    <button
+                      type="button"
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        onSnapToTime(satWarpNode.targetTimeMs);
+                        setSatWarpNode(null);
+                      }}
+                      className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20 border border-white/20 text-slate-200 text-[9px] cursor-pointer"
+                    >
+                      ⚡ Snap
+                    </button>
+                  )}
+                </div>
+              </div>
+            </Html>
+          </group>
+        );
+      })()}
 
       {showOrbits &&
         evaluation.activeSatellites.map((st) => {
@@ -967,7 +1580,7 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
         roverWorkflowStep !== 'rover-setup' &&
         (() => {
           const liftR = (elevKm: number, extra = 0.0042) =>
-            1.0 + ((elevKm + 9.12) / 19.88 - 0.458) * dispScale + extra;
+            1.0 + ((elevKm + 8.98) / 19.67 - 0.4565) * dispScale + extra;
 
           const startCoord =
             roverStartCoords || roverRangeEnvelope?.origin || roverPlan?.start || null;
@@ -1415,7 +2028,7 @@ const MoonSceneContent: React.FC<SceneContentProps> = ({
       <OrbitControls
         ref={controlsRef}
         enablePan={false}
-        minDistance={1.045}
+        minDistance={isSouthPoleFocus ? 1.012 : 1.045}
         maxDistance={trueOrbitScale ? 46 : 9.5}
         rotateSpeed={0.62}
         zoomSpeed={0.85}

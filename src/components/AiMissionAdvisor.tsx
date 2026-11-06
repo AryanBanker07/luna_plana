@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Bot, KeyRound, Send, Sparkles } from 'lucide-react';
+import { ShieldCheck, Calendar, Sun, Radio, Mountain, Sparkles } from 'lucide-react';
 import {
   OptimalWindowRecommendation,
   SatellitePassWindow,
@@ -13,289 +13,208 @@ interface AiMissionAdvisorProps {
   onJumpToTime: (ms: number) => void;
 }
 
-interface ChatItem {
-  role: 'user' | 'assistant';
-  text: string;
-}
-
-const QUICK_PROMPTS = [
-  'Full Go/No-Go Risk Brief',
-  'Comm Blackout & Relay Plan',
-  'Power & Night Survival',
-  'Best Touchdown Epoch',
-];
-
-function buildDeterministicBrief(
-  prompt: string,
-  ev: SiteEvaluation,
-  passes: SatellitePassWindow[],
-  optimalWindows: OptimalWindowRecommendation[]
-): string {
-  const q = prompt.toLowerCase();
-  const isPolar = Math.abs(ev.site.lat) > 75;
-  const bestFlux = isPolar ? ev.solarFluxVerticalMastWm2 : ev.solarFluxHorizontalWm2;
-  const relayPasses = passes.filter((p) => p.isRelay);
-
-  if (q.includes('comm') || q.includes('relay') || q.includes('blackout') || q.includes('dte')) {
-    const dteText = ev.earth.isVisible
-      ? `Direct-to-Earth (DTE) is OPEN at +${ev.earth.elevationDeg}° elevation (clearing the ${ev.earth.horizonDeg}° local crater rim by +${(ev.earth.elevationDeg - ev.earth.horizonDeg).toFixed(1)}°).`
-      : `Direct-to-Earth (DTE) is BLOCKED (Earth at ${ev.earth.elevationDeg}° vs +${ev.earth.horizonDeg}° terrain mask).`;
-
-    const activeRelayList =
-      ev.visibleRelays.length > 0
-        ? `Currently ${ev.visibleRelays.length} relay orbiter(s) are overhead: ${ev.visibleRelays
-            .map(
-              (r) =>
-                `${r.satellite.name.split(' (')[0]} (+${r.elevationDeg}°, ${r.instantDataRateMbps} Mbps)`
-            )
-            .join('; ')}.`
-        : `Zero relays currently above horizon mask; next relay AOS in ${
-            relayPasses[0]
-              ? `${Math.max(1, Math.round((relayPasses[0].aosTimeMs - ev.timestampMs) / 60000))} min (${relayPasses[0].satelliteName.split(' ')[0]})`
-              : '<60 min'
-          }.`;
-
-    return `COMM ARCHITECTURE BRIEF [${ev.site.name}]:\n• ${dteText}\n• ${activeRelayList}\n• Recommendation: Configure S/X-band HGA for primary DTE when Earth latitude libration > +1.5°, with autonomous UHF/S-band failover to Queqiao-2 (16,941 km apolune dwell) and CAPSTONE/Gateway NRHO.`;
-  }
-
-  if (q.includes('power') || q.includes('night') || q.includes('solar') || q.includes('thermal')) {
-    const arrayType = isPolar
-      ? '2 m deployable vertical 1-axis tracking solar mast (captures grazing ~1–6° polar sunlight)'
-      : 'horizontal body-mounted / gull-wing solar deck';
-    return `POWER & THERMAL SURVIVAL [${ev.site.name}]:\n• Instantaneous Irradiance: ${bestFlux} W/m² (${
-      ev.sun.isVisible ? `Sun El +${ev.sun.elevationDeg}°` : 'LOCAL ECLIPSE'
-    }), Surface Temp ${ev.surfaceTempK} K.\n• Annual Illumination Duty: ${ev.illuminationDutyPct}%.\n• Hardware Guidance: Deploy ${arrayType}. ${
-      ev.illuminationDutyPct >= 75
-        ? 'High polar ridge duty limits max continuous shadow <55 hours — survivable on Li-ion secondary batteries (1.8 kWh/100W load) without RTGs.'
-        : 'Long eclipse durations require Radioisotope Heater Units (RHUs) or solid-oxide regenerative fuel cells.'
-    }`;
-  }
-
-  if (q.includes('touchdown') || q.includes('epoch') || q.includes('best') || q.includes('window')) {
-    if (optimalWindows.length === 0) {
-      return `WINDOW SCAN [${ev.site.name}]: Deeply shadowed site (${ev.illuminationDutyPct}% annual sun). Recommend RTG/nuclear rover traverse from an adjacent sunlit rim rather than solar touchdown.`;
-    }
-    const top = optimalWindows[0];
-    const startStr = new Date(top.startMs).toISOString().slice(0, 16).replace('T', ' ') + 'Z';
-    return `OPTIMAL TOUCHDOWN EPOCH [${ev.site.name}]:\n• #1 Window Opens: ${startStr} (${top.durationHours} hrs continuous sunlight, Score ${top.score}/100).\n• Comm Lock: ${top.dteCoveragePct}% Direct-to-Earth + ${top.relayCoveragePct}% Cislunar Relay backup.\n• Click "Jump to #1 Window" above to synchronize the 3D globe and orbital ephemeris.`;
-  }
-
-  // Default comprehensive Go/No-Go synthesis
-  return `FLIGHT READINESS BRIEF — ${ev.site.name} [${ev.overallStatus} • ${ev.readinessScore}/100]:\n• Topography: Elev ${
-    ev.elevationKm >= 0 ? '+' : ''
-  }${ev.elevationKm} km, Slope ${ev.slopeDeg}° (${
-    ev.slopeDeg <= 8 ? 'SAFE <8° ellipse' : 'HDA LIDAR REQUIRED'
-  }).\n• Power & Thermal: ${
-    ev.sun.isVisible ? `${bestFlux} W/m² sunlit` : 'Shadowed'
-  } | ${ev.surfaceTempK} K | ${ev.illuminationDutyPct}% annual sun.\n• Comms & ISRU: ${
-    ev.earth.isVisible ? `DTE Open (+${ev.earth.elevationDeg}°)` : `Relay-dependent (${ev.visibleRelays.length} active)`
-  } | ${ev.waterIceWtPct} wt% H₂O-eq volatile potential.`;
-}
-
 export const AiMissionAdvisor: React.FC<AiMissionAdvisorProps> = ({
   evaluation,
   passes,
   optimalWindows,
   onJumpToTime,
 }) => {
-  const [input, setInput] = useState('');
-  const [apiKey, setApiKey] = useState('');
-  const [showKeyBox, setShowKeyBox] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [messages, setMessages] = useState<ChatItem[]>([]);
+  const [activeCategory, setActiveCategory] = useState<'overview' | 'comms' | 'power'>('overview');
 
-  const askAdvisor = async (promptText: string) => {
-    const trimmed = promptText.trim();
-    if (!trimmed) return;
-    setMessages((prev) => [...prev.slice(-4), { role: 'user', text: trimmed }]);
-    setInput('');
+  const isPolar = Math.abs(evaluation.site.lat) > 75;
+  const bestFlux = isPolar
+    ? evaluation.solarFluxVerticalMastWm2
+    : evaluation.solarFluxHorizontalWm2;
+  const relayPasses = passes.filter((p) => p.isRelay);
 
-    // If user supplied a live Gemini API key, synthesize with Gemini 2.5 Flash using live telemetry context!
-    if (apiKey.trim().length > 20) {
-      setLoading(true);
-      try {
-        const telemetryContext = JSON.stringify({
-          site: evaluation.site.name,
-          lat: evaluation.site.lat,
-          lon: evaluation.site.lon,
-          elevKm: evaluation.elevationKm,
-          slopeDeg: evaluation.slopeDeg,
-          tempK: evaluation.surfaceTempK,
-          sun: evaluation.sun,
-          earth: evaluation.earth,
-          illuminationDutyPct: evaluation.illuminationDutyPct,
-          waterIceWtPct: evaluation.waterIceWtPct,
-          visibleRelays: evaluation.visibleRelays.map((r) => ({
-            name: r.satellite.name,
-            el: r.elevationDeg,
-            mbps: r.instantDataRateMbps,
-          })),
-          overallStatus: evaluation.overallStatus,
-          readinessScore: evaluation.readinessScore,
-        });
-
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(
-            apiKey.trim()
-          )}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [
-                {
-                  parts: [
-                    {
-                      text: `You are SELENE-AI, a concise NASA CLPS & Artemis Lunar Mission Flight Director. Given this live selenographic telemetry JSON: ${telemetryContext}\n\nAnswer the planner's request in <= 95 words with crisp bullet points and concrete numbers: ${trimmed}`,
-                    },
-                  ],
-                },
-              ],
-            }),
-          }
-        );
-        const data = await res.json();
-        const reply =
-          data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-          buildDeterministicBrief(trimmed, evaluation, passes, optimalWindows);
-        setMessages((prev) => [...prev, { role: 'assistant', text: reply }]);
-      } catch {
-        const fallback = buildDeterministicBrief(
-          trimmed,
-          evaluation,
-          passes,
-          optimalWindows
-        );
-        setMessages((prev) => [...prev, { role: 'assistant', text: fallback }]);
-      } finally {
-        setLoading(false);
-      }
-      return;
-    }
-
-    // Instant zero-latency onboard physics & flight-rule synthesis
-    const reply = buildDeterministicBrief(trimmed, evaluation, passes, optimalWindows);
-    setMessages((prev) => [...prev.slice(-5), { role: 'assistant', text: reply }]);
-  };
+  const topWindow = optimalWindows[0];
 
   return (
     <div className="pt-2.5 border-t border-white/[0.07] space-y-2">
+      {/* Header & Status Indicator */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-1.5">
-          <Bot className="w-3.5 h-3.5 text-[#fbbf24]" />
+          <ShieldCheck className="w-3.5 h-3.5 text-[#38bdf8]" />
           <span className="text-[11px] font-display uppercase tracking-[0.12em] text-slate-200 font-semibold">
-            SELENE-AI Flight Co-Pilot
+            Flight Readiness & Windows
           </span>
         </div>
-        <button
-          type="button"
-          onClick={() => setShowKeyBox((v) => !v)}
-          className="hud-btn flex items-center gap-1 text-[10px] font-mono-tech text-slate-400 hover:text-[#7dd3fc] cursor-pointer"
-          title="Optional: Connect Gemini API key for open-ended LLM queries (Onboard Physics AI active by default)"
+        <span
+          className={`text-[10px] font-mono-tech px-2 py-0.5 rounded border font-semibold ${
+            evaluation.overallStatus === 'GO'
+              ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300'
+              : evaluation.overallStatus === 'CAUTION'
+              ? 'bg-amber-500/15 border-amber-500/40 text-amber-300'
+              : 'bg-rose-500/15 border-rose-500/40 text-rose-300'
+          }`}
         >
-          <KeyRound className="w-3 h-3" />
-          <span>{apiKey ? 'Gemini Live' : 'Onboard AI'}</span>
-        </button>
+          {evaluation.overallStatus} ({evaluation.readinessScore}/100)
+        </span>
       </div>
 
-      {showKeyBox && (
-        <input
-          type="password"
-          value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
-          placeholder="Optional Gemini API Key (blank = Onboard Physics Engine)"
-          className="w-full bg-[#060911] border border-white/15 rounded px-2 py-1 text-[11px] font-mono-tech text-slate-200 focus:outline-none focus:border-[#38bdf8]"
-        />
-      )}
-
-      {/* Top Optimal Touchdown Window Pill */}
-      {optimalWindows.length > 0 && (
-        <div className="p-2 rounded-lg bg-[#f59e0b]/[0.08] border border-[#f59e0b]/30 flex items-center justify-between gap-2">
-          <div className="text-[10px] leading-tight">
-            <div className="font-mono-tech text-[#fcd34d] font-semibold">
-              ★ #1 Optimal Window: {optimalWindows[0].durationHours}h Sunlit
+      {/* Primary Recommended Touchdown Window Card */}
+      {topWindow ? (
+        <div className="p-2.5 rounded-lg bg-[#38bdf8]/[0.06] border border-[#38bdf8]/25 flex items-center justify-between gap-2">
+          <div className="text-[10px] leading-tight min-w-0">
+            <div className="flex items-center gap-1 font-mono-tech text-[#7dd3fc] font-semibold">
+              <Calendar className="w-3 h-3 text-[#38bdf8] shrink-0" />
+              <span>
+                Recommended Epoch: {topWindow.durationHours}h Continuous Sunlight
+              </span>
             </div>
-            <div className="text-slate-400 mt-0.5">
-              {new Date(optimalWindows[0].startMs).toISOString().slice(0, 13).replace('T', ' ')}Z •{' '}
-              DTE {optimalWindows[0].dteCoveragePct}% / Relay {optimalWindows[0].relayCoveragePct}%
+            <div className="text-slate-400 mt-1 font-mono-tech text-[9.5px]">
+              {new Date(topWindow.startMs).toISOString().slice(0, 16).replace('T', ' ')}Z •{' '}
+              DTE {topWindow.dteCoveragePct}% • Relay {topWindow.relayCoveragePct}%
             </div>
           </div>
           <button
             type="button"
-            onClick={() => onJumpToTime(optimalWindows[0].startMs + 6 * 3600 * 1000)}
-            className="hud-btn shrink-0 px-2 py-1 rounded bg-[#f59e0b] text-[#05070b] font-mono-tech font-semibold text-[10px] hover:bg-[#fbbf24] cursor-pointer flex items-center gap-1"
+            onClick={() => onJumpToTime(topWindow.startMs + 6 * 3600 * 1000)}
+            className="hud-btn shrink-0 px-2.5 py-1 rounded bg-[#38bdf8] text-[#05070b] font-mono-tech font-bold text-[10px] hover:bg-[#7dd3fc] cursor-pointer flex items-center gap-1 shadow-sm"
           >
             <Sparkles className="w-3 h-3" />
-            <span>Jump</span>
+            <span>Warp</span>
           </button>
-        </div>
-      )}
-
-      {/* Quick Tactical Prompts */}
-      <div className="flex flex-wrap gap-1">
-        {QUICK_PROMPTS.map((qp) => (
-          <button
-            key={qp}
-            type="button"
-            onClick={() => askAdvisor(qp)}
-            className="hud-btn px-2 py-0.5 rounded bg-white/[0.04] hover:bg-white/[0.09] border border-white/10 text-[10px] text-slate-300 cursor-pointer"
-          >
-            {qp}
-          </button>
-        ))}
-      </div>
-
-      {/* Latest Briefing Output */}
-      {messages.length > 0 ? (
-        <div className="max-h-[155px] overflow-y-auto space-y-1.5 bg-[#060911] rounded-lg border border-white/10 p-2 text-[11px]">
-          {messages.slice(-2).map((m, i) => (
-            <div
-              key={i}
-              className={
-                m.role === 'user'
-                  ? 'text-[10px] font-mono-tech text-[#7dd3fc]'
-                  : 'text-slate-200 whitespace-pre-line leading-relaxed'
-              }
-            >
-              {m.role === 'user' ? `> ${m.text}` : m.text}
-            </div>
-          ))}
-          {loading && (
-            <div className="text-[10px] font-mono-tech text-[#fcd34d] animate-pulse">
-              Synthesizing telemetry...
-            </div>
-          )}
         </div>
       ) : (
-        <div className="bg-[#060911] rounded-lg border border-white/10 p-2 text-[11px] text-slate-300 whitespace-pre-line leading-relaxed">
-          {buildDeterministicBrief('Full Go/No-Go Risk Brief', evaluation, passes, optimalWindows)}
+        <div className="p-2 rounded-lg bg-white/[0.02] border border-white/10 text-[10px] text-slate-400">
+          Permanent shadow region — solar touchdown unavailable. RTG / nuclear power required.
         </div>
       )}
 
-      {/* Custom Question Input */}
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          askAdvisor(input);
-        }}
-        className="flex items-center gap-1.5"
-      >
-        <input
-          type="text"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder="Ask SELENE-AI (e.g., 'relay gaps', 'solar mast')..."
-          className="flex-1 bg-[#060911] border border-white/15 rounded-md px-2.5 py-1 text-[11px] text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-[#f59e0b]"
-        />
+      {/* Category Toggle Tabs */}
+      <div className="grid grid-cols-3 gap-1 p-0.5 rounded bg-black/30 border border-white/[0.08] text-[10px] font-mono-tech">
         <button
-          type="submit"
-          className="hud-btn p-1.5 rounded-md bg-[#f59e0b]/20 hover:bg-[#f59e0b]/35 border border-[#f59e0b]/40 text-[#fcd34d] cursor-pointer"
-          aria-label="Send query"
+          type="button"
+          onClick={() => setActiveCategory('overview')}
+          className={`py-1 rounded text-center cursor-pointer transition-colors ${
+            activeCategory === 'overview'
+              ? 'bg-white/10 text-white font-semibold'
+              : 'text-slate-400 hover:text-slate-200'
+          }`}
         >
-          <Send className="w-3.5 h-3.5" />
+          Synthesis
         </button>
-      </form>
+        <button
+          type="button"
+          onClick={() => setActiveCategory('comms')}
+          className={`py-1 rounded text-center cursor-pointer transition-colors ${
+            activeCategory === 'comms'
+              ? 'bg-white/10 text-white font-semibold'
+              : 'text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          Comms
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveCategory('power')}
+          className={`py-1 rounded text-center cursor-pointer transition-colors ${
+            activeCategory === 'power'
+              ? 'bg-white/10 text-white font-semibold'
+              : 'text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          Power/Thermal
+        </button>
+      </div>
+
+      {/* Detailed Analysis Output Card */}
+      <div className="bg-[#060911] rounded-lg border border-white/10 p-2.5 text-[10.5px] leading-relaxed space-y-1.5 font-mono-tech">
+        {activeCategory === 'overview' && (
+          <div className="space-y-1.5">
+            <div className="flex items-start gap-1.5 text-slate-300">
+              <Mountain className="w-3.5 h-3.5 text-[#38bdf8] shrink-0 mt-0.5" />
+              <div>
+                <span className="text-white font-semibold">Terrain:</span> Elev{' '}
+                {evaluation.elevationKm >= 0 ? '+' : ''}
+                {evaluation.elevationKm.toFixed(2)} km • Slope {evaluation.slopeDeg.toFixed(1)}° (
+                {evaluation.slopeDeg <= 8 ? (
+                  <span className="text-emerald-400">Safe &lt;8°</span>
+                ) : (
+                  <span className="text-amber-400">Hazard &gt;8°</span>
+                )}
+                )
+              </div>
+            </div>
+            <div className="flex items-start gap-1.5 text-slate-300">
+              <Sun className="w-3.5 h-3.5 text-[#fbbf24] shrink-0 mt-0.5" />
+              <div>
+                <span className="text-white font-semibold">Illumination:</span>{' '}
+                {evaluation.sun.isVisible ? (
+                  <span className="text-amber-300">Sunlit (+{evaluation.sun.elevationDeg.toFixed(1)}°)</span>
+                ) : (
+                  <span className="text-slate-400">Shadowed</span>
+                )}{' '}
+                • {evaluation.illuminationDutyPct}% annual duty • {evaluation.surfaceTempK} K
+              </div>
+            </div>
+            <div className="flex items-start gap-1.5 text-slate-300">
+              <Radio className="w-3.5 h-3.5 text-[#34d399] shrink-0 mt-0.5" />
+              <div>
+                <span className="text-white font-semibold">Comms:</span>{' '}
+                {evaluation.earth.isVisible ? (
+                  <span className="text-emerald-300">DTE Open (+{evaluation.earth.elevationDeg.toFixed(1)}°)</span>
+                ) : (
+                  <span className="text-amber-300">DTE Masked</span>
+                )}{' '}
+                • {evaluation.visibleRelays.length} active relay(s) in line-of-sight
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeCategory === 'comms' && (
+          <div className="text-slate-300 space-y-1">
+            <div className="text-white font-semibold flex items-center gap-1">
+              <Radio className="w-3 h-3 text-[#34d399]" />
+              <span>Direct-to-Earth (DTE) & Cislunar Relays</span>
+            </div>
+            <p>
+              • DTE Status:{' '}
+              {evaluation.earth.isVisible
+                ? `OPEN at +${evaluation.earth.elevationDeg.toFixed(1)}° (clearing +${evaluation.earth.horizonDeg.toFixed(1)}° rim)`
+                : `BLOCKED (Earth at ${evaluation.earth.elevationDeg.toFixed(1)}° vs +${evaluation.earth.horizonDeg.toFixed(1)}° mask)`}
+            </p>
+            <p>
+              • Active Constellation:{' '}
+              {evaluation.visibleRelays.length > 0
+                ? evaluation.visibleRelays
+                    .map(
+                      (r) =>
+                        `${r.satellite.name.split(' (')[0]} (+${r.elevationDeg.toFixed(0)}°, ${r.instantDataRateMbps} Mbps)`
+                    )
+                    .join(', ')
+                : relayPasses[0]
+                ? `Next AOS in ${Math.max(1, Math.round((relayPasses[0].aosTimeMs - evaluation.timestampMs) / 60000))}m (${relayPasses[0].satelliteName.split(' ')[0]})`
+                : 'No active pass in next hour'}
+            </p>
+          </div>
+        )}
+
+        {activeCategory === 'power' && (
+          <div className="text-slate-300 space-y-1">
+            <div className="text-white font-semibold flex items-center gap-1">
+              <Sun className="w-3 h-3 text-[#fbbf24]" />
+              <span>Solar Irradiance & Thermal Environment</span>
+            </div>
+            <p>
+              • Solar Flux: {bestFlux.toFixed(0)} W/m² (
+              {evaluation.sun.isVisible
+                ? `El +${evaluation.sun.elevationDeg.toFixed(1)}°`
+                : 'Local Shadow'}
+              ) • Temp {evaluation.surfaceTempK} K
+            </p>
+            <p>
+              • Architecture: {isPolar ? 'Vertical 1-axis tracking mast' : 'Horizontal solar deck'} (
+              {evaluation.illuminationDutyPct >= 75
+                ? 'High polar ridge duty limits continuous eclipse <55h'
+                : 'Requires battery reserve or RHUs for eclipse'}
+              )
+            </p>
+          </div>
+        )}
+      </div>
     </div>
   );
 };
-

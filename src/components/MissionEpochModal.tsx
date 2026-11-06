@@ -3,7 +3,6 @@ import {
   Calendar,
   Clock,
   Check,
-  Move,
   RotateCcw,
   Sparkles,
   X,
@@ -191,10 +190,6 @@ export const MissionEpochModal: React.FC<MissionEpochModalProps> = ({
                 <h2 className="text-sm font-display font-bold uppercase tracking-wider text-white">
                   Mission Time & Orbital Epoch Selector
                 </h2>
-                <span className="flex items-center gap-1 text-[9px] font-mono-tech px-1.5 py-0.5 rounded bg-amber-500/15 text-[#fcd34d] border border-amber-400/30">
-                  <Move className="w-2.5 h-2.5" />
-                  <span>Movable</span>
-                </span>
                 {(offset.x !== 0 || offset.y !== 0) && (
                   <button
                     type="button"
